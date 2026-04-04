@@ -1,0 +1,27 @@
+# PostgreSQL for SelfWash (local / VPS). Usage:
+#   1. Copy .env.example lines for POSTGRES_* and DATABASE_URL into .env
+#   2. pip install "psycopg[binary]"
+#   3. docker compose up -d
+#   4. Run consumer.py (same machine: host localhost)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: selfwash-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-selfwash}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-selfwash}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - selfwash_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-selfwash} -d ${POSTGRES_DB:-selfwash}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  selfwash_pgdata:

@@ -1,0 +1,14 @@
+.env
+.env.local
+*.db
+transactions.db
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
