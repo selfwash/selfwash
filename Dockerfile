@@ -8,6 +8,6 @@ ENV PYTHONUNBUFFERED=1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY consumer.py db.py ./
+COPY consumer.py db.py api.py ./
 
 CMD ["python", "-u", "consumer.py"]
