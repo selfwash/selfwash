@@ -6,11 +6,13 @@ import json
 import logging
 import os
 from contextlib import contextmanager
+from pathlib import Path
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Generator, Optional
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -23,6 +25,7 @@ from sqlalchemy import (
     delete,
     event,
     select,
+    text,
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
@@ -55,12 +58,12 @@ class NayaxTransaction(Base):
     # Last SQS delivery (audit / debugging)
     sqs_message_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
 
-    nayax_transaction_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
-    remote_start_transaction_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    nayax_transaction_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
+    remote_start_transaction_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
     payment_method_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    site_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
-    machine_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    site_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
+    machine_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
     machine_time: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     void: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
 
@@ -81,9 +84,9 @@ class NayaxTransaction(Base):
     machine_group: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     operator_identifier: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 
-    actor_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    actor_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
     actor_description: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
-    location_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    location_code: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     location_description: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     area_description: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
 
@@ -127,7 +130,7 @@ class NayaxTransactionProduct(Base):
     product_name: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     product_group: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     product_pa_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    product_code_in_map: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    product_code_in_map: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     amount_bruto: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 4), nullable=True)
     discount_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 4), nullable=True)
     discount_percentage: Mapped[Optional[Decimal]] = mapped_column(Numeric(9, 4), nullable=True)
@@ -212,8 +215,29 @@ def _sqlite_pragmas(dbapi_conn: Any, _record: Any) -> None:
         cursor.close()
 
 
+def _apply_postgres_migrations(eng: Engine) -> None:
+    """Run SQL files under migrations/ for existing Postgres DBs (e.g. int4 → bigint)."""
+    if eng.dialect.name != "postgresql":
+        return
+    mig_dir = Path(__file__).resolve().parent / "migrations"
+    if not mig_dir.is_dir():
+        return
+    for path in sorted(mig_dir.glob("*.sql")):
+        sql = path.read_text(encoding="utf-8").strip()
+        if not sql:
+            continue
+        try:
+            with eng.begin() as conn:
+                conn.execute(text(sql))
+            log.debug("Postgres migration script OK: %s", path.name)
+        except Exception:
+            log.exception("Postgres migration failed: %s", path.name)
+            raise
+
+
 def init_db() -> None:
     Base.metadata.create_all(engine)
+    _apply_postgres_migrations(engine)
     url = _engine_url()
     if url.startswith("sqlite"):
         log.info(
