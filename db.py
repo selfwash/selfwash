@@ -32,6 +32,14 @@ log = logging.getLogger(__name__)
 _DEFAULT_SQLITE = "sqlite:///./transactions.db"
 
 
+def _running_on_railway() -> bool:
+    return bool(
+        os.environ.get("RAILWAY_ENVIRONMENT")
+        or os.environ.get("RAILWAY_SERVICE_ID")
+        or os.environ.get("RAILWAY_PROJECT_ID")
+    )
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -143,13 +151,26 @@ def _normalize_database_url(url: str) -> str:
 
 def _engine_url() -> str:
     """
-    DATABASE_URL if set → Postgres (Railway/Heroku URLs normalized) or explicit sqlite:// URL.
-    If unset → default SQLite file ./transactions.db (same path for consumer + API when both run in one container).
+    Production (Railway): DATABASE_URL must point to PostgreSQL (plugin reference). SQLite is not
+    persisted across deploys on Railway.
+
+    Local dev: omit DATABASE_URL to use ./transactions.db, or set DATABASE_URL to Postgres/sqlite explicitly.
     """
     raw = os.environ.get("DATABASE_URL", "").strip()
     if not raw:
+        if _running_on_railway():
+            raise RuntimeError(
+                "DATABASE_URL is required on Railway. In the Railway dashboard: New → Database → "
+                "PostgreSQL, then on this service Variables → New Variable → Reference → "
+                "select Postgres → DATABASE_URL. Redeploy."
+            )
         return _DEFAULT_SQLITE
     if raw.startswith("sqlite"):
+        if _running_on_railway():
+            raise RuntimeError(
+                "On Railway use PostgreSQL (DATABASE_URL from the Postgres plugin), not sqlite:// — "
+                "container disk is ephemeral."
+            )
         return raw
     return _normalize_database_url(raw)
 

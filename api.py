@@ -1,6 +1,5 @@
 """
-Read-only HTTP API for Lovable / dashboards. Uses the same db engine as consumer.py (one process
-layout on Railway: docker-entrypoint.sh runs uvicorn + consumer; shared SQLite or DATABASE_URL).
+Read-only HTTP API for Lovable / dashboards. Uses the same db engine as consumer.py. Railway: DATABASE_URL must reference PostgreSQL (persistent).
 """
 
 from __future__ import annotations

@@ -1,6 +1,7 @@
 # Single Railway service: SQS consumer + FastAPI (see docker-entrypoint.sh).
-# Generate a public domain for this service — GET /health for healthchecks.
-# For production durability use PostgreSQL: set DATABASE_URL (SQLite on Railway disk is ephemeral).
+# REQUIRED: Add PostgreSQL (New → Database → PostgreSQL), then Variables → Reference DATABASE_URL
+# from that database onto this service. SQLite is rejected on Railway (db.py).
+# Generate a public domain — GET /health for healthchecks.
 
 [build]
 builder = "DOCKERFILE"

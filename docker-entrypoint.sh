@@ -1,6 +1,5 @@
 #!/bin/sh
-# Single Railway service: API (uvicorn) + SQS consumer share one process tree and the same SQLite file
-# under /app/transactions.db (enable Postgres with DATABASE_URL instead for durable data).
+# Single Railway service: uvicorn (API) + consumer.py (SQS). Both use db.py → DATABASE_URL (Postgres on Railway).
 
 set -e
 PORT="${PORT:-8000}"

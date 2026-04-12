@@ -1,8 +1,8 @@
 """
 Poll Nayax transaction messages from Amazon SQS and process them.
 
-Shares db.py with api.py: same DATABASE_URL or default SQLite ./transactions.db when both run
-in one Railway container (docker-entrypoint.sh).
+Shares db.py with api.py. On Railway, DATABASE_URL → PostgreSQL is required (see db.py). Locally,
+SQLite ./transactions.db is used when DATABASE_URL is unset.
 
 Credentials: default boto3 chain (env vars, ~/.aws/credentials, or IAM role).
 """
