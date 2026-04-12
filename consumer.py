@@ -1,8 +1,10 @@
 """
 Poll Nayax transaction messages from Amazon SQS and process them.
 
+Uses the same DATABASE_URL as api.py (PostgreSQL on Railway — reference one Postgres plugin on
+both services). Locally, omit DATABASE_URL to use SQLite ./transactions.db.
+
 Credentials: default boto3 chain (env vars, ~/.aws/credentials, or IAM role).
-Configure via .env (copy from .env.example) or environment variables.
 """
 
 from __future__ import annotations

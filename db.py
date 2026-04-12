@@ -32,6 +32,14 @@ log = logging.getLogger(__name__)
 _DEFAULT_SQLITE = "sqlite:///./transactions.db"
 
 
+def _running_on_railway() -> bool:
+    return bool(
+        os.environ.get("RAILWAY_ENVIRONMENT")
+        or os.environ.get("RAILWAY_SERVICE_ID")
+        or os.environ.get("RAILWAY_PROJECT_ID")
+    )
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -142,8 +150,20 @@ def _normalize_database_url(url: str) -> str:
 
 
 def _engine_url() -> str:
+    """
+    Single source of truth: DATABASE_URL (same value on consumer + API for shared Postgres).
+
+    - If DATABASE_URL is set → use it (Postgres after normalize, or explicit sqlite:// for local).
+    - If unset on Railway → fail fast (avoids two separate ephemeral SQLite files).
+    - If unset locally → default SQLite file for dev.
+    """
     raw = os.environ.get("DATABASE_URL", "").strip()
     if not raw:
+        if _running_on_railway():
+            raise RuntimeError(
+                "DATABASE_URL is required on Railway. On both services (worker + API), add a variable "
+                "reference to your PostgreSQL plugin's DATABASE_URL so consumer and API share one database."
+            )
         return _DEFAULT_SQLITE
     if raw.startswith("sqlite"):
         return raw
@@ -188,7 +208,14 @@ def _sqlite_fk(dbapi_conn: Any, _record: Any) -> None:
 
 def init_db() -> None:
     Base.metadata.create_all(engine)
-    log.info("SQL ready: %s", _engine_url().split("@")[-1] if "@" in _engine_url() else _engine_url())
+    url = _engine_url()
+    if url.startswith("sqlite"):
+        log.info("SQL ready (SQLite, dev only): %s", url.split("///")[-1] if "///" in url else url)
+    else:
+        log.info(
+            "SQL ready (shared PostgreSQL via DATABASE_URL): %s",
+            url.split("@")[-1] if "@" in url else url[:48] + "...",
+        )
 
 
 @contextmanager
