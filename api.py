@@ -1,8 +1,6 @@
 """
-Read-only HTTP API for Lovable / dashboards. Reads the same PostgreSQL as consumer.py (shared DATABASE_URL).
-
-Railway: set SERVICE_ROLE=api (see docker-entrypoint.sh). DATABASE_URL must reference the same
-Postgres plugin variable as the worker — never rely on separate SQLite files per service.
+Read-only HTTP API for Lovable / dashboards. Uses the same db engine as consumer.py (one process
+layout on Railway: docker-entrypoint.sh runs uvicorn + consumer; shared SQLite or DATABASE_URL).
 """
 
 from __future__ import annotations

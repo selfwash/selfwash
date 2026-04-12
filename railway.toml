@@ -1,23 +1,14 @@
-# Railway config-as-code: https://docs.railway.com/reference/config-as-code
-#
-# This repo runs TWO roles from the SAME Docker image (see docker-entrypoint.sh):
-#   1) Worker (default): SQS → DB   SERVICE_ROLE unset or "worker"
-#   2) API (Lovable):     HTTP       SERVICE_ROLE=api
-#
-# On Railway:
-#   - Keep your existing "selfwash" service as the worker (no change, or set SERVICE_ROLE=worker).
-#   - Add a second service → same GitHub repo → set Variable SERVICE_ROLE=api
-#   - API service also needs: DATABASE_URL (ref Postgres), CORS_ORIGINS, optional READ_API_KEY
-#   - API: Settings → Networking → Generate Domain. Health: GET /health
-#
+# Single Railway service: SQS consumer + FastAPI (see docker-entrypoint.sh).
+# Generate a public domain for this service — GET /health for healthchecks.
+# For production durability use PostgreSQL: set DATABASE_URL (SQLite on Railway disk is ephemeral).
+
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-# Always use entrypoint so SERVICE_ROLE=api vs worker works; clears any old dashboard start command.
 startCommand = "/app/docker-entrypoint.sh"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 50
-# No healthcheckPath here: the worker has no HTTP. On the API service only, add in Railway UI:
-#   Settings → Deploy → Healthcheck Path = /health
+healthcheckPath = "/health"
+healthcheckTimeout = 100

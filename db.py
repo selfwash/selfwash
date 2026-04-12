@@ -32,14 +32,6 @@ log = logging.getLogger(__name__)
 _DEFAULT_SQLITE = "sqlite:///./transactions.db"
 
 
-def _running_on_railway() -> bool:
-    return bool(
-        os.environ.get("RAILWAY_ENVIRONMENT")
-        or os.environ.get("RAILWAY_SERVICE_ID")
-        or os.environ.get("RAILWAY_PROJECT_ID")
-    )
-
-
 class Base(DeclarativeBase):
     pass
 
@@ -151,19 +143,11 @@ def _normalize_database_url(url: str) -> str:
 
 def _engine_url() -> str:
     """
-    Single source of truth: DATABASE_URL (same value on consumer + API for shared Postgres).
-
-    - If DATABASE_URL is set → use it (Postgres after normalize, or explicit sqlite:// for local).
-    - If unset on Railway → fail fast (avoids two separate ephemeral SQLite files).
-    - If unset locally → default SQLite file for dev.
+    DATABASE_URL if set → Postgres (Railway/Heroku URLs normalized) or explicit sqlite:// URL.
+    If unset → default SQLite file ./transactions.db (same path for consumer + API when both run in one container).
     """
     raw = os.environ.get("DATABASE_URL", "").strip()
     if not raw:
-        if _running_on_railway():
-            raise RuntimeError(
-                "DATABASE_URL is required on Railway. On both services (worker + API), add a variable "
-                "reference to your PostgreSQL plugin's DATABASE_URL so consumer and API share one database."
-            )
         return _DEFAULT_SQLITE
     if raw.startswith("sqlite"):
         return raw
@@ -199,9 +183,10 @@ SessionLocal = sessionmaker(engine, class_=Session, autoflush=False, autocommit=
 
 
 @event.listens_for(engine, "connect")
-def _sqlite_fk(dbapi_conn: Any, _record: Any) -> None:
+def _sqlite_pragmas(dbapi_conn: Any, _record: Any) -> None:
     if engine.dialect.name == "sqlite":
         cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
 
@@ -210,7 +195,10 @@ def init_db() -> None:
     Base.metadata.create_all(engine)
     url = _engine_url()
     if url.startswith("sqlite"):
-        log.info("SQL ready (SQLite, dev only): %s", url.split("///")[-1] if "///" in url else url)
+        log.info(
+            "SQL ready (SQLite file, shared by consumer+API in one container): %s",
+            url.split("///")[-1] if "///" in url else url,
+        )
     else:
         log.info(
             "SQL ready (shared PostgreSQL via DATABASE_URL): %s",
