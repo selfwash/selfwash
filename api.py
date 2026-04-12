@@ -10,6 +10,7 @@ import os
 from datetime import datetime, time, timezone
 from decimal import Decimal
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -23,6 +24,28 @@ load_dotenv()
 from db import NayaxTransaction, NayaxTransactionProduct, SessionLocal, init_db
 
 READ_API_KEY = os.environ.get("READ_API_KEY", "").strip()
+
+_TZ_ISRAEL = ZoneInfo("Asia/Jerusalem")
+
+
+def _as_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _iso_utc(dt: Optional[datetime]) -> Optional[str]:
+    if dt is None:
+        return None
+    return _as_utc(dt).isoformat()
+
+
+def _iso_israel(dt: Optional[datetime]) -> Optional[str]:
+    """Israel civil time (DST-aware via IANA zone)."""
+    if dt is None:
+        return None
+    return _as_utc(dt).astimezone(_TZ_ISRAEL).isoformat()
+
 
 # Every scalar column we expose on each transaction (plus identifiers + optional payload/products).
 TRANSACTION_FIELD_KEYS = [
@@ -60,6 +83,7 @@ TRANSACTION_FIELD_KEYS = [
     "display_card_number",
     "card_type",
     "received_at",
+    "received_at_utc",
 ]
 
 
@@ -85,7 +109,7 @@ def _cors_origins() -> list[str]:
 _origins = _cors_origins()
 _cors_credentials = False if _origins == ["*"] else True
 
-app = FastAPI(title="SelfWash API", version="1.2.0")
+app = FastAPI(title="SelfWash API", version="1.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
@@ -186,7 +210,8 @@ def _tx_full(
         "card_last_4": row.card_last_4,
         "display_card_number": row.display_card_number,
         "card_type": row.card_type,
-        "received_at": row.received_at.isoformat() if row.received_at else None,
+        "received_at": _iso_israel(row.received_at),
+        "received_at_utc": _iso_utc(row.received_at),
     }
     if include_payload:
         raw = row.payload_json
@@ -250,7 +275,11 @@ def health() -> dict[str, str]:
 def api_meta() -> dict[str, Any]:
     """Describe query params for dashboard builders."""
     return {
-        "version": "1.2.0",
+        "version": "1.3.0",
+        "timezones": {
+            "received_at": "Asia/Jerusalem (ISO local offset changes with DST)",
+            "received_at_utc": "UTC — use for since= / filters against DB (stored UTC)",
+        },
         "identifiers": {
             "row_id": "Our DB primary key — use in GET /api/transactions/{row_id}",
             "nayax_transaction_id": "Nayax TransactionId (same family as JSON TransactionId / Data['Transaction ID'])",
@@ -274,7 +303,7 @@ def api_meta() -> dict[str, Any]:
         "list_query_params": {
             "from_date": "YYYY-MM-DD or ISO8601 — filter received_at >= (UTC)",
             "to_date": "YYYY-MM-DD or ISO8601 — filter received_at <= end of day (UTC)",
-            "since": "ISO8601 — rows with received_at strictly after (live polling)",
+            "since": "ISO8601 UTC (or offset) — DB compare; use received_at_utc from last response",
             "site_id": "integer",
             "machine_id": "integer",
             "nayax_transaction_id": "integer",
@@ -285,7 +314,7 @@ def api_meta() -> dict[str, Any]:
             "parse_payload": "if include_payload, return payload as JSON object under key payload",
             "include_products": "include product lines (heavy)",
         },
-        "live_polling_hint": "Store max(received_at) from last response; next call use since=<that ISO8601>&order=asc",
+        "live_polling_hint": "Store max(received_at_utc); next call since=<that value>&order=asc (UTC matches DB)",
     }
 
 
@@ -294,7 +323,10 @@ def list_transactions(
     db: Session = Depends(get_db),
     from_date: Optional[str] = Query(None, description="received_at >= (YYYY-MM-DD or ISO8601 UTC)"),
     to_date: Optional[str] = Query(None, description="received_at <= end of to_date (UTC)"),
-    since: Optional[str] = Query(None, description="received_at > since (ISO8601) for live feed"),
+    since: Optional[str] = Query(
+        None,
+        description="received_at > since — UTC/offset ISO; use received_at_utc from last response for live feed",
+    ),
     site_id: Optional[int] = None,
     machine_id: Optional[int] = None,
     nayax_transaction_id: Optional[int] = None,
