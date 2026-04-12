@@ -26,6 +26,56 @@ from db import NayaxTransaction, NayaxTransactionProduct, SessionLocal, init_db
 
 READ_API_KEY = os.environ.get("READ_API_KEY", "").strip()
 
+# Every scalar column we expose on each transaction (plus identifiers + optional payload/products).
+TRANSACTION_FIELD_KEYS = [
+    "identifiers",
+    "id",
+    "sqs_message_id",
+    "nayax_transaction_id",
+    "remote_start_transaction_id",
+    "payment_method_id",
+    "site_id",
+    "machine_id",
+    "machine_time",
+    "void",
+    "currency",
+    "se_value",
+    "authorization_value",
+    "payed_value",
+    "settlement_time",
+    "authorization_time",
+    "pay_serv_trans_id",
+    "authorization_rrn",
+    "payment_method_description",
+    "recognition_description",
+    "machine_name",
+    "machine_group",
+    "operator_identifier",
+    "actor_id",
+    "actor_description",
+    "location_code",
+    "location_description",
+    "area_description",
+    "consumer_id",
+    "card_first_4",
+    "card_last_4",
+    "display_card_number",
+    "card_type",
+    "received_at",
+]
+
+
+def _identifiers(row: NayaxTransaction) -> dict[str, Any]:
+    """Stable IDs for dashboards — Nayax business id + our row id + related refs."""
+    return {
+        "row_id": row.id,
+        "nayax_transaction_id": row.nayax_transaction_id,
+        "remote_start_transaction_id": row.remote_start_transaction_id,
+        "pay_serv_trans_id": row.pay_serv_trans_id,
+        "authorization_rrn": row.authorization_rrn,
+        "sqs_message_id": row.sqs_message_id,
+    }
+
 
 def _cors_origins() -> list[str]:
     raw = os.environ.get("CORS_ORIGINS", "*").strip()
@@ -37,7 +87,7 @@ def _cors_origins() -> list[str]:
 _origins = _cors_origins()
 _cors_credentials = False if _origins == ["*"] else True
 
-app = FastAPI(title="SelfWash API", version="1.1.0")
+app = FastAPI(title="SelfWash API", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
@@ -105,6 +155,7 @@ def _tx_full(
     parse_payload: bool = False,
 ) -> dict[str, Any]:
     out: dict[str, Any] = {
+        "identifiers": _identifiers(row),
         "id": row.id,
         "sqs_message_id": row.sqs_message_id,
         "nayax_transaction_id": row.nayax_transaction_id,
@@ -201,7 +252,21 @@ def health() -> dict[str, str]:
 def api_meta() -> dict[str, Any]:
     """Describe query params for dashboard builders."""
     return {
-        "version": "1.1.0",
+        "version": "1.2.0",
+        "identifiers": {
+            "row_id": "Our DB primary key — use in GET /api/transactions/{row_id}",
+            "nayax_transaction_id": "Nayax TransactionId (same family as JSON TransactionId / Data['Transaction ID'])",
+            "remote_start_transaction_id": "Nayax RemoteStartTransactionId when present",
+            "pay_serv_trans_id": "Payment service transaction id when present",
+            "authorization_rrn": "Authorization RRN when present",
+            "sqs_message_id": "Last SQS MessageId that delivered this row (audit)",
+        },
+        "transaction_scalar_fields": TRANSACTION_FIELD_KEYS,
+        "nayax_extra_fields": (
+            "Any column Nayax sends that is not extracted to SQL still exists inside "
+            "payload_json / payload (use include_payload=true, optionally parse_payload=true). "
+            "Product lines are in products[] when include_products=true or on detail routes."
+        ),
         "endpoints": {
             "list": "GET /api/transactions",
             "detail_by_row_id": "GET /api/transactions/{row_id}",
