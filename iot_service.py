@@ -4,6 +4,7 @@ import base64
 import json
 import hashlib
 import hmac
+import logging
 import os
 import time
 from secrets import token_hex
@@ -34,6 +35,7 @@ CLOSE_TYPE_LABELS = {
     "5": "error",
     "6": "network",
 }
+logger = logging.getLogger(__name__)
 
 
 def _generate_order_id() -> str:
@@ -57,6 +59,11 @@ def _normalize_aes256_key(key_material: bytes) -> bytes:
     if len(key_material) < 32:
         return key_material.ljust(32, b"\0")
     return hashlib.sha256(key_material).digest()
+
+
+def _is_crypto_debug_enabled() -> bool:
+    raw = os.getenv("VMT_DEBUG_CRYPTO", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _decode_b64_maybe(value: str, *, urlsafe: bool) -> bytes | None:
@@ -85,29 +92,64 @@ def _load_enc_key() -> bytes:
     - shorter -> zero-pad to 32 bytes
     - longer -> SHA-256 to 32 bytes
     """
-    key_raw = os.getenv("VMT_ENC_KEY", "").strip() or os.getenv("IOT_ENC_KEY", "").strip()
+    key_source = "VMT_ENC_KEY"
+    key_raw = os.getenv("VMT_ENC_KEY", "").strip()
+    if not key_raw:
+        key_source = "IOT_ENC_KEY"
+        key_raw = os.getenv("IOT_ENC_KEY", "").strip()
     if not key_raw:
         raise ValueError("Missing VMT_ENC_KEY in environment.")
+
+    debug = _is_crypto_debug_enabled()
+    candidates: list[tuple[str, bytes]] = []
 
     # 1) Try hex decode first when the string looks hex-ish.
     if len(key_raw) % 2 == 0:
         try:
-            return _normalize_aes256_key(bytes.fromhex(key_raw))
+            hex_bytes = bytes.fromhex(key_raw)
+            candidates.append(("hex", hex_bytes))
         except ValueError:
             pass
 
     # 2) Try standard base64.
     b64_decoded = _decode_b64_maybe(key_raw, urlsafe=False)
     if b64_decoded is not None:
-        return _normalize_aes256_key(b64_decoded)
+        candidates.append(("base64", b64_decoded))
 
     # 3) Try URL-safe base64.
     b64url_decoded = _decode_b64_maybe(key_raw, urlsafe=True)
     if b64url_decoded is not None:
-        return _normalize_aes256_key(b64url_decoded)
+        candidates.append(("base64url", b64url_decoded))
 
-    # 4) Fallback to raw bytes and normalize.
-    return _normalize_aes256_key(key_raw.encode("utf-8"))
+    # 4) Raw bytes candidate.
+    raw_bytes = key_raw.encode("utf-8")
+    candidates.append(("raw", raw_bytes))
+
+    # Prefer exact AES-256 key lengths to avoid accidental format mismatch.
+    for fmt, key_bytes in candidates:
+        if len(key_bytes) == 32:
+            if debug:
+                logger.warning(
+                    "VMT crypto key loaded: source=%s format=%s raw_len=%d decoded_len=%d normalized=no",
+                    key_source,
+                    fmt,
+                    len(key_raw),
+                    len(key_bytes),
+                )
+            return key_bytes
+
+    # Fallback: normalize raw bytes to 32. Useful only when env value is not in a valid 32-byte form.
+    normalized = _normalize_aes256_key(raw_bytes)
+    if debug:
+        lengths = ", ".join([f"{fmt}:{len(value)}" for fmt, value in candidates])
+        logger.warning(
+            "VMT crypto key normalized fallback used: source=%s raw_len=%d candidate_lengths=[%s] normalized_len=%d",
+            key_source,
+            len(key_raw),
+            lengths,
+            len(normalized),
+        )
+    return normalized
 
 
 def _encrypt_enc1(inner_payload: dict, kid: str) -> str:
