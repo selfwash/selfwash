@@ -158,7 +158,7 @@ def _load_enc_key() -> bytes:
     return normalized
 
 
-def _encrypt_enc1(inner_payload: dict, kid: str, ts: str) -> str:
+def _encrypt_enc1(inner_payload: dict, kid: str, ts: str, nonce: str) -> str:
     """
     Encrypt inner payload with AES-256-GCM and return ENC1 JSON string.
     """
@@ -166,7 +166,6 @@ def _encrypt_enc1(inner_payload: dict, kid: str, ts: str) -> str:
     aesgcm = AESGCM(key)
 
     iv = os.urandom(12)
-    body_nonce = token_hex(16)
     plaintext = json.dumps(inner_payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     ciphertext_with_tag = aesgcm.encrypt(iv, plaintext, None)
     ciphertext = ciphertext_with_tag[:-16]
@@ -177,7 +176,7 @@ def _encrypt_enc1(inner_payload: dict, kid: str, ts: str) -> str:
         "alg": "AES-256-GCM",
         "kid": kid,
         "ts": ts,
-        "nonce": body_nonce,
+        "nonce": nonce,
         "iv": base64.b64encode(iv).decode("utf-8"),
         "ct": base64.b64encode(ciphertext).decode("utf-8"),
         "tag": base64.b64encode(tag).decode("utf-8"),
@@ -363,8 +362,8 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
     debug = _is_crypto_debug_enabled()
 
     def _send_once(ts: str) -> tuple[dict, requests.Response]:
-        enc1_json_body = _encrypt_enc1(inner_payload, kid=kid, ts=ts)
         request_nonce = token_hex(16)
+        enc1_json_body = _encrypt_enc1(inner_payload, kid=kid, ts=ts, nonce=request_nonce)
         signature = _build_signature(
             app_secret=app_secret,
             app_key=app_key,
