@@ -296,6 +296,24 @@ def _is_timestamp_expired(payload: dict) -> bool:
     return False
 
 
+def _is_bad_signature(payload: dict) -> bool:
+    """Detect VMT bad-signature error from response payload."""
+    if not isinstance(payload, dict):
+        return False
+    response = payload.get("response")
+    if not isinstance(response, dict):
+        return False
+    errors = response.get("errors")
+    if isinstance(errors, list):
+        for item in errors:
+            if isinstance(item, str) and "bad signature" in item.lower():
+                return True
+    message = response.get("message")
+    if isinstance(message, str) and "bad signature" in message.lower():
+        return True
+    return False
+
+
 def _server_time_from_response(response: requests.Response) -> int | None:
     """Extract server clock (seconds) from HTTP Date response header."""
     date_header = response.headers.get("Date", "").strip()
@@ -315,18 +333,25 @@ def _build_signature(
     timestamp: str,
     nonce: str,
     enc1_json_body: str,
+    signature_format: str = "newline",
 ) -> str:
     body_b64 = base64.b64encode(enc1_json_body.encode("utf-8")).decode("utf-8")
-    string_to_sign = "\n".join(
-        [
-            "POST",
-            command_path,
-            app_key,
-            timestamp,
-            nonce,
-            body_b64,
-        ]
-    )
+    if signature_format == "kv":
+        string_to_sign = (
+            f"method=POST&path={command_path}&app_key={app_key}&timestamp={timestamp}"
+            f"&nonce={nonce}&body_b64={body_b64}"
+        )
+    else:
+        string_to_sign = "\n".join(
+            [
+                "POST",
+                command_path,
+                app_key,
+                timestamp,
+                nonce,
+                body_b64,
+            ]
+        )
     return hmac.new(
         app_secret.encode("utf-8"),
         string_to_sign.encode("utf-8"),
@@ -360,8 +385,9 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
 
     url = f"{base_url}{command_path}"
     debug = _is_crypto_debug_enabled()
+    signature_format = os.getenv("VMT_SIGNATURE_FORMAT", "newline").strip().lower() or "newline"
 
-    def _send_once(ts: str) -> tuple[dict, requests.Response]:
+    def _send_once(ts: str, sig_format: str) -> tuple[dict, requests.Response]:
         request_nonce = token_hex(16)
         enc1_json_body = _encrypt_enc1(inner_payload, kid=kid, ts=ts, nonce=request_nonce)
         signature = _build_signature(
@@ -371,6 +397,7 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
             timestamp=ts,
             nonce=request_nonce,
             enc1_json_body=enc1_json_body,
+            signature_format=sig_format,
         )
         headers = {
             "X-App-Key": app_key,
@@ -389,7 +416,19 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
         return _decrypt_enc1_response(raw_payload), response
 
     first_ts = _now_ts()
-    payload, response = _send_once(first_ts)
+    active_signature_format = signature_format
+    payload, response = _send_once(first_ts, active_signature_format)
+
+    if _is_bad_signature(payload):
+        alt_signature_format = "kv" if active_signature_format == "newline" else "newline"
+        if debug:
+            logger.warning(
+                "VMT signature retry: first_format=%s alt_format=%s",
+                active_signature_format,
+                alt_signature_format,
+            )
+        payload, response = _send_once(first_ts, alt_signature_format)
+        active_signature_format = alt_signature_format
 
     if _is_timestamp_expired(payload):
         server_ts = _server_time_from_response(response)
@@ -407,7 +446,7 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
             if debug:
                 logger.warning("VMT timestamp retry: first_ts=%s no_server_date retry_ts=%s", first_ts, retry_ts)
 
-        payload, _ = _send_once(retry_ts)
+        payload, _ = _send_once(retry_ts, active_signature_format)
 
     return payload
 
