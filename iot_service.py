@@ -17,6 +17,23 @@ DEFAULT_COMMAND_PATH = "/openapi/v1/json/command"
 DEFAULT_BASE_URL = "http://101.132.171.125:8686"
 DEFAULT_VMT_APP_KEY = "rsaO2oAK2I7lfauO8wK3opgGnaNwiVHy"
 DEFAULT_VMT_REGION = "ap-southeast-3"
+OPEN_TYPE_LABELS = {
+    "0": "coin",
+    "1": "paper",
+    "2": "card",
+    "3": "network",
+    "4": "nayax",
+    "5": "pulse-coin",
+    "6": "test_button",
+}
+CLOSE_TYPE_LABELS = {
+    "1": "button",
+    "2": "no_balance",
+    "3": "idle_time_over",
+    "4": "time_over",
+    "5": "error",
+    "6": "network",
+}
 
 
 def _generate_order_id() -> str:
@@ -153,7 +170,39 @@ def _decrypt_enc1_response(payload: dict) -> dict:
     except Exception as exc:
         raise ValueError("Decrypted ENC1 response is not valid JSON") from exc
 
-    return decoded if isinstance(decoded, dict) else {"data": decoded}
+    if not isinstance(decoded, dict):
+        return {"data": decoded}
+    return _decode_vmt_response_fields(decoded)
+
+
+def _decode_vmt_response_fields(decoded: dict) -> dict:
+    """
+    Decode known VMT fields into readable labels based on Command_explain.jsonc.
+    """
+    data = decoded.get("data")
+    if not isinstance(data, dict):
+        return decoded
+
+    order_info = data.get("order_info")
+    if not isinstance(order_info, dict):
+        return decoded
+
+    open_type_raw = order_info.get("open_type")
+    close_type_raw = order_info.get("close_type")
+
+    if open_type_raw is not None:
+        open_key = str(open_type_raw).strip()
+        open_label = OPEN_TYPE_LABELS.get(open_key)
+        if open_label:
+            order_info["open_type_label"] = open_label
+
+    if close_type_raw not in (None, ""):
+        close_key = str(close_type_raw).strip()
+        close_label = CLOSE_TYPE_LABELS.get(close_key)
+        if close_label:
+            order_info["close_type_label"] = close_label
+
+    return decoded
 
 
 def _build_signature(
