@@ -15,12 +15,15 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from requests import RequestException
 from sqlalchemy import and_, asc, desc, func, select
 from sqlalchemy.orm import Session, selectinload
 
 load_dotenv()
 
 from db import NayaxTransaction, NayaxTransactionProduct, SessionLocal, init_db
+from iot_service import close_machine_order, create_machine_order, get_machine_state, start_machine
 
 READ_API_KEY = os.environ.get("READ_API_KEY", "").strip()
 
@@ -102,7 +105,18 @@ def _cors_origins() -> list[str]:
     raw = os.environ.get("CORS_ORIGINS", "*").strip()
     if raw == "*":
         return ["*"]
-    return [o.strip() for o in raw.split(",") if o.strip()]
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+
+    # Optional Lovable-specific origins can be appended without replacing CORS_ORIGINS.
+    lovable_origin = os.environ.get("LOVABLE_ORIGIN", "").strip()
+    if lovable_origin:
+        origins.append(lovable_origin)
+    lovable_origins_raw = os.environ.get("LOVABLE_ORIGINS", "").strip()
+    if lovable_origins_raw:
+        origins.extend([o.strip() for o in lovable_origins_raw.split(",") if o.strip()])
+
+    # De-duplicate while preserving order.
+    return list(dict.fromkeys(origins))
 
 
 _origins = _cors_origins()
@@ -113,7 +127,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
     allow_credentials=_cors_credentials,
-    allow_methods=["GET", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -268,6 +282,88 @@ def _filter_conditions(
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+class StartMachineRequest(BaseModel):
+    device_sn: str
+    prepay_money: float
+
+
+class CreateOrderRequest(BaseModel):
+    prepay_money: float
+
+
+class CloseOrderRequest(BaseModel):
+    order_id: str
+
+
+@app.post("/api/machines/start")
+def start_machine_endpoint(payload: StartMachineRequest) -> dict[str, Any]:
+    if not payload.device_sn.strip():
+        raise HTTPException(status_code=400, detail="device_sn is required")
+    try:
+        iot_result = start_machine(device_sn=payload.device_sn.strip(), prepay_money=payload.prepay_money)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RequestException:
+        raise HTTPException(status_code=500, detail="Failed to call IoT command API")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Unexpected server error while starting machine")
+
+    order_id = iot_result.get("order_id")
+    if not order_id:
+        raise HTTPException(status_code=500, detail="IoT API response missing order_id")
+
+    return {"success": True, "order_id": order_id}
+
+
+@app.get("/api/machines/{device_sn}/state")
+def get_machine_state_endpoint(device_sn: str) -> dict[str, Any]:
+    if not device_sn.strip():
+        raise HTTPException(status_code=400, detail="device_sn is required")
+    try:
+        iot_result = get_machine_state(device_sn=device_sn.strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RequestException:
+        raise HTTPException(status_code=500, detail="Failed to call IoT command API")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Unexpected server error while checking machine state")
+    return {"success": True, "device_sn": device_sn.strip(), "result": iot_result}
+
+
+@app.post("/api/machines/{device_sn}/create_order")
+def create_order_endpoint(device_sn: str, payload: CreateOrderRequest) -> dict[str, Any]:
+    if not device_sn.strip():
+        raise HTTPException(status_code=400, detail="device_sn is required")
+    try:
+        iot_result = create_machine_order(device_sn=device_sn.strip(), prepay_money=payload.prepay_money)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RequestException:
+        raise HTTPException(status_code=500, detail="Failed to call IoT command API")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Unexpected server error while creating order")
+
+    order_id = iot_result.get("order_id")
+    if not order_id:
+        raise HTTPException(status_code=500, detail="IoT API response missing order_id")
+    return {"success": True, "device_sn": device_sn.strip(), "order_id": order_id, "result": iot_result}
+
+
+@app.post("/api/machines/{device_sn}/close_order")
+def close_order_endpoint(device_sn: str, payload: CloseOrderRequest) -> dict[str, Any]:
+    if not device_sn.strip():
+        raise HTTPException(status_code=400, detail="device_sn is required")
+    try:
+        iot_result = close_machine_order(device_sn=device_sn.strip(), order_id=payload.order_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RequestException:
+        raise HTTPException(status_code=500, detail="Failed to call IoT command API")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Unexpected server error while closing order")
+    return {"success": True, "device_sn": device_sn.strip(), "order_id": payload.order_id.strip(), "result": iot_result}
 
 
 @app.get("/api/meta")
