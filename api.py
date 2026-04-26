@@ -9,21 +9,28 @@ import logging
 import os
 from datetime import datetime, time, timezone
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from zoneinfo import ZoneInfo
 
+import requests
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from requests import RequestException
-from sqlalchemy import and_, asc, desc, func, select
+from sqlalchemy import and_, asc, delete, desc, func, select
 from sqlalchemy.orm import Session, selectinload
 
 load_dotenv()
 
-from db import NayaxTransaction, NayaxTransactionProduct, SessionLocal, init_db
+from db import (
+    AppUser,
+    AppUserPermission,
+    NayaxTransaction,
+    NayaxTransactionProduct,
+    SessionLocal,
+    init_db,
+)
 from iot_service import (
     close_machine_order,
     create_machine_order,
@@ -33,9 +40,30 @@ from iot_service import (
     start_machine,
     write_machine_config,
 )
+from security import (
+    ALL_KNOWN_PERMISSIONS,
+    AuthContext,
+    PERM_ADMIN_USERS,
+    PERM_MACHINES_READ,
+    PERM_MACHINES_WRITE,
+    PERM_NAYAX_READ,
+    REVIEW_APPROVED,
+    REVIEW_PENDING,
+    REVIEW_REJECTED,
+    create_access_token,
+    decode_access_token,
+    hash_password,
+    load_permissions_for_user,
+    verify_password,
+)
 
 READ_API_KEY = os.environ.get("READ_API_KEY", "").strip()
 logger = logging.getLogger(__name__)
+JWT_SECRET = os.environ.get("JWT_SECRET", "").strip()
+SIGNUP_NOTIFY_WEBHOOK_URL = os.environ.get("SIGNUP_NOTIFY_WEBHOOK_URL", "").strip()
+SIGNUP_NOTIFY_WEBHOOK_SECRET = os.environ.get("SIGNUP_NOTIFY_WEBHOOK_SECRET", "").strip()
+_ALLOW_SIGNUP_RAW = os.environ.get("ALLOW_PUBLIC_SIGNUP", "1").strip().lower()
+ALLOW_PUBLIC_SIGNUP = _ALLOW_SIGNUP_RAW not in ("0", "false", "no", "")
 
 _TZ_ISRAEL = ZoneInfo("Asia/Jerusalem")
 
@@ -155,17 +183,6 @@ app.add_middleware(
 )
 
 
-@app.middleware("http")
-async def _optional_api_key(request: Request, call_next: Any) -> Any:
-    if request.method == "OPTIONS":
-        return await call_next(request)
-    path = request.url.path
-    if READ_API_KEY and path.startswith("/api"):
-        if request.headers.get("X-API-Key") != READ_API_KEY:
-            return JSONResponse(status_code=401, content={"detail": "Invalid or missing X-API-Key"})
-    return await call_next(request)
-
-
 def get_db() -> Any:
     db = SessionLocal()
     try:
@@ -174,9 +191,118 @@ def get_db() -> Any:
         db.close()
 
 
+def _raise_if_user_not_approved_for_api(user: AppUser) -> None:
+    """Block JWT access for pending/rejected accounts (distinct from is_active for approved users)."""
+    if user.review_status == REVIEW_PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "pending_approval", "message": "Account is waiting for admin approval."},
+        )
+    if user.review_status == REVIEW_REJECTED:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "rejected", "message": "This account was not approved."},
+        )
+
+
+def _notify_signup_webhook(
+    *,
+    user_id: int,
+    username: str,
+    email: Optional[str],
+    note: Optional[str],
+) -> None:
+    if not SIGNUP_NOTIFY_WEBHOOK_URL:
+        return
+    body: dict[str, Any] = {
+        "event": "user_signup_pending",
+        "user_id": user_id,
+        "username": username,
+        "email": email,
+        "registration_note": note,
+    }
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if SIGNUP_NOTIFY_WEBHOOK_SECRET:
+        headers["X-Webhook-Secret"] = SIGNUP_NOTIFY_WEBHOOK_SECRET
+    try:
+        r = requests.post(SIGNUP_NOTIFY_WEBHOOK_URL, json=body, headers=headers, timeout=12)
+        if r.status_code >= 400:
+            logger.warning("Signup notify webhook returned %s: %s", r.status_code, r.text[:500])
+    except RequestException as exc:
+        logger.warning("Signup notify webhook request failed: %s", exc)
+
+
+def authenticate(
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+) -> AuthContext:
+    """Valid `X-API-Key` (when READ_API_KEY is set) grants full access; otherwise use `Authorization: Bearer <JWT>`."""
+    if READ_API_KEY and x_api_key == READ_API_KEY:
+        return AuthContext(source="api_key", permissions=set(ALL_KNOWN_PERMISSIONS))
+    if authorization and authorization.startswith("Bearer "):
+        if not JWT_SECRET:
+            raise HTTPException(status_code=503, detail="JWT auth not configured (set JWT_SECRET)")
+        token = authorization[7:].strip()
+        try:
+            payload = decode_access_token(token)
+            uid = int(payload["sub"])
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        user = db.get(AppUser, uid)
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found or inactive")
+        _raise_if_user_not_approved_for_api(user)
+        if not user.is_active:
+            raise HTTPException(status_code=401, detail="User inactive or not found")
+        perms = load_permissions_for_user(db, user)
+        return AuthContext(source="jwt", user=user, permissions=perms)
+    if READ_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key or Bearer token")
+    raise HTTPException(status_code=401, detail="Missing Authorization: Bearer <token> (set READ_API_KEY for key-based access)")
+
+
+def require_permission(perm: str):
+    def _check(auth: AuthContext = Depends(authenticate)) -> AuthContext:
+        if not auth.has(perm):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Missing permission: {perm}")
+        return auth
+
+    return _check
+
+
+def _maybe_bootstrap_admin() -> None:
+    user = os.environ.get("BOOTSTRAP_ADMIN_USERNAME", "").strip()
+    pw = os.environ.get("BOOTSTRAP_ADMIN_PASSWORD", "").strip()
+    if not user or not pw:
+        return
+    db = SessionLocal()
+    try:
+        n = db.scalar(select(func.count()).select_from(AppUser))
+        if n and n > 0:
+            return
+        db.add(
+            AppUser(
+                username=user,
+                password_hash=hash_password(pw),
+                is_active=True,
+                is_superuser=True,
+                review_status=REVIEW_APPROVED,
+            )
+        )
+        db.commit()
+        logger.info("Bootstrap: created superuser %s", user)
+    except Exception:
+        logger.exception("Bootstrap admin failed")
+        db.rollback()
+    finally:
+        db.close()
+
+
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
+    _maybe_bootstrap_admin()
 
 
 def _dec(v: Optional[Decimal]) -> Optional[float]:
@@ -324,8 +450,291 @@ class WriteConfigRequest(BaseModel):
     params: dict[str, Any]
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class AdminUserCreateRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=6, max_length=256)
+    is_active: bool = True
+    is_superuser: bool = False
+    permissions: list[str] = Field(default_factory=list)
+
+
+class AdminUserUpdateRequest(BaseModel):
+    password: Optional[str] = None
+    is_active: Optional[bool] = None
+    is_superuser: Optional[bool] = None
+    permissions: Optional[list[str]] = None
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=2, max_length=128)
+    password: str = Field(min_length=6, max_length=256)
+    email: Optional[str] = Field(default=None, max_length=256)
+    registration_note: Optional[str] = Field(default=None, max_length=4000)
+
+
+class UserReviewRequest(BaseModel):
+    action: Literal["approve", "reject"]
+    permissions: list[str] = Field(
+        default_factory=list,
+        description="Applied on approve; ignored for superuser (all permissions).",
+    )
+    is_superuser: bool = False
+
+
+@app.post("/api/auth/login")
+def auth_login(body: LoginRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+    if not JWT_SECRET:
+        raise HTTPException(status_code=503, detail="JWT_SECRET is not set; cannot issue tokens")
+    u = db.scalar(select(AppUser).where(AppUser.username == body.username.strip()))
+    if u is None or not verify_password(body.password, u.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    if u.review_status == REVIEW_PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "pending_approval", "message": "Account is waiting for admin approval."},
+        )
+    if u.review_status == REVIEW_REJECTED:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "rejected", "message": "This account was not approved."},
+        )
+    if not u.is_active:
+        raise HTTPException(status_code=401, detail="User inactive or not found")
+    token = create_access_token(user_id=u.id)
+    perms = load_permissions_for_user(db, u)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": u.id,
+            "username": u.username,
+            "is_superuser": u.is_superuser,
+            "permissions": sorted(perms),
+        },
+    }
+
+
+@app.post("/api/auth/register")
+def auth_register(body: RegisterRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Request access: creates a user in pending state; admin must approve and assign permissions."""
+    if not ALLOW_PUBLIC_SIGNUP:
+        raise HTTPException(status_code=403, detail="Public registration is disabled")
+    uname = body.username.strip()
+    if not uname:
+        raise HTTPException(status_code=400, detail="Username is required")
+    if db.scalar(select(AppUser).where(AppUser.username == uname)) is not None:
+        raise HTTPException(status_code=400, detail="Username already taken")
+    email = (body.email or "").strip() or None
+    note = (body.registration_note or "").strip() or None
+    u = AppUser(
+        username=uname,
+        password_hash=hash_password(body.password),
+        is_active=False,
+        is_superuser=False,
+        review_status=REVIEW_PENDING,
+        email=email,
+        registration_note=note,
+    )
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+    _notify_signup_webhook(user_id=u.id, username=uname, email=email, note=note)
+    return {
+        "status": "pending",
+        "message": "Request received. You can sign in after an administrator approves your account.",
+        "user_id": u.id,
+    }
+
+
+@app.get("/api/auth/me")
+def auth_me(auth: AuthContext = Depends(authenticate)) -> dict[str, Any]:
+    if auth.source == "api_key":
+        return {"type": "api_key", "full_access": True}
+    assert auth.user is not None
+    u = auth.user
+    return {
+        "type": "user",
+        "id": u.id,
+        "username": u.username,
+        "is_superuser": u.is_superuser,
+        "permissions": sorted(auth.permissions),
+        "review_status": u.review_status,
+        "email": u.email,
+    }
+
+
+@app.get("/api/admin/permissions")
+def admin_list_permissions(_auth: AuthContext = Depends(require_permission(PERM_ADMIN_USERS))) -> dict[str, Any]:
+    return {"permissions": sorted(ALL_KNOWN_PERMISSIONS)}
+
+
+@app.get("/api/admin/users")
+def admin_list_users(db: Session = Depends(get_db), _auth: AuthContext = Depends(require_permission(PERM_ADMIN_USERS))) -> dict[str, Any]:
+    users = list(db.scalars(select(AppUser).order_by(AppUser.id)).all())
+    out: list[dict[str, Any]] = []
+    for u in users:
+        perms = load_permissions_for_user(db, u) if not u.is_superuser else set(ALL_KNOWN_PERMISSIONS)
+        out.append(
+            {
+                "id": u.id,
+                "username": u.username,
+                "is_active": u.is_active,
+                "is_superuser": u.is_superuser,
+                "review_status": u.review_status,
+                "email": u.email,
+                "registration_note": u.registration_note,
+                "permissions": sorted(perms) if not u.is_superuser else sorted(ALL_KNOWN_PERMISSIONS),
+            }
+        )
+    return {"items": out}
+
+
+@app.get("/api/admin/pending-registrations")
+def admin_list_pending(
+    db: Session = Depends(get_db),
+    _auth: AuthContext = Depends(require_permission(PERM_ADMIN_USERS)),
+) -> dict[str, Any]:
+    rows = list(
+        db.scalars(select(AppUser).where(AppUser.review_status == REVIEW_PENDING).order_by(AppUser.created_at)).all()
+    )
+    items: list[dict[str, Any]] = []
+    for u in rows:
+        items.append(
+            {
+                "id": u.id,
+                "username": u.username,
+                "email": u.email,
+                "registration_note": u.registration_note,
+                "created_at": _iso_utc(u.created_at),
+            }
+        )
+    return {"items": items}
+
+
+@app.post("/api/admin/users/{user_id}/review")
+def admin_review_user(
+    user_id: int,
+    body: UserReviewRequest,
+    db: Session = Depends(get_db),
+    _auth: AuthContext = Depends(require_permission(PERM_ADMIN_USERS)),
+) -> dict[str, Any]:
+    u = db.get(AppUser, user_id)
+    if u is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if body.action == "reject":
+        u.review_status = REVIEW_REJECTED
+        u.is_active = False
+        u.is_superuser = False
+        db.execute(delete(AppUserPermission).where(AppUserPermission.user_id == u.id))
+        db.commit()
+        return {"status": "rejected", "user_id": u.id}
+    if u.review_status == REVIEW_APPROVED and u.is_active:
+        raise HTTPException(
+            status_code=400,
+            detail="User is already active; use PATCH /api/admin/users to update permissions or deactivate.",
+        )
+    bad = [p for p in body.permissions if p not in ALL_KNOWN_PERMISSIONS]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"Unknown permissions: {bad}")
+    u.review_status = REVIEW_APPROVED
+    u.is_active = True
+    u.is_superuser = bool(body.is_superuser)
+    db.execute(delete(AppUserPermission).where(AppUserPermission.user_id == u.id))
+    if u.is_superuser:
+        pass
+    else:
+        for p in body.permissions:
+            if p:
+                db.add(AppUserPermission(user_id=u.id, permission=p))
+    db.commit()
+    return {
+        "status": "approved",
+        "user_id": u.id,
+        "is_superuser": u.is_superuser,
+        "permissions": sorted(ALL_KNOWN_PERMISSIONS) if u.is_superuser else sorted(body.permissions),
+    }
+
+
+@app.post("/api/admin/users")
+def admin_create_user(
+    body: AdminUserCreateRequest,
+    db: Session = Depends(get_db),
+    _auth: AuthContext = Depends(require_permission(PERM_ADMIN_USERS)),
+) -> dict[str, Any]:
+    uname = body.username.strip()
+    if db.scalar(select(AppUser).where(AppUser.username == uname)) is not None:
+        raise HTTPException(status_code=400, detail="Username already exists")
+    bad = [p for p in body.permissions if p not in ALL_KNOWN_PERMISSIONS]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"Unknown permissions: {bad}")
+    u = AppUser(
+        username=uname,
+        password_hash=hash_password(body.password),
+        is_active=body.is_active,
+        is_superuser=body.is_superuser,
+        review_status=REVIEW_APPROVED,
+    )
+    db.add(u)
+    db.flush()
+    for p in body.permissions:
+        if p:
+            db.add(AppUserPermission(user_id=u.id, permission=p))
+    db.commit()
+    return {"id": u.id, "username": u.username}
+
+
+@app.patch("/api/admin/users/{user_id}")
+def admin_update_user(
+    user_id: int,
+    body: AdminUserUpdateRequest,
+    db: Session = Depends(get_db),
+    _auth: AuthContext = Depends(require_permission(PERM_ADMIN_USERS)),
+) -> dict[str, str]:
+    u = db.get(AppUser, user_id)
+    if u is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if body.password is not None:
+        u.password_hash = hash_password(body.password)
+    if body.is_active is not None:
+        u.is_active = body.is_active
+    if body.is_superuser is not None:
+        u.is_superuser = body.is_superuser
+    if body.permissions is not None:
+        bad = [p for p in body.permissions if p not in ALL_KNOWN_PERMISSIONS]
+        if bad:
+            raise HTTPException(status_code=400, detail=f"Unknown permissions: {bad}")
+        db.execute(delete(AppUserPermission).where(AppUserPermission.user_id == u.id))
+        for p in body.permissions:
+            if p:
+                db.add(AppUserPermission(user_id=u.id, permission=p))
+    db.commit()
+    return {"status": "ok"}
+
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    _auth: AuthContext = Depends(require_permission(PERM_ADMIN_USERS)),
+) -> dict[str, str]:
+    u = db.get(AppUser, user_id)
+    if u is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    db.delete(u)
+    db.commit()
+    return {"status": "ok"}
+
+
 @app.post("/api/machines/start")
-def start_machine_endpoint(payload: StartMachineRequest) -> dict[str, Any]:
+def start_machine_endpoint(
+    payload: StartMachineRequest,
+    _auth: AuthContext = Depends(require_permission(PERM_MACHINES_WRITE)),
+) -> dict[str, Any]:
     if not payload.device_sn.strip():
         raise HTTPException(status_code=400, detail="device_sn is required")
     try:
@@ -345,7 +754,10 @@ def start_machine_endpoint(payload: StartMachineRequest) -> dict[str, Any]:
 
 
 @app.get("/api/machines/{device_sn}/state")
-def get_machine_state_endpoint(device_sn: str) -> dict[str, Any]:
+def get_machine_state_endpoint(
+    device_sn: str,
+    _auth: AuthContext = Depends(require_permission(PERM_MACHINES_READ)),
+) -> dict[str, Any]:
     if not device_sn.strip():
         raise HTTPException(status_code=400, detail="device_sn is required")
     try:
@@ -360,7 +772,10 @@ def get_machine_state_endpoint(device_sn: str) -> dict[str, Any]:
 
 
 @app.get("/api/machines/list")
-def list_machines_endpoint(limit: int = Query(100, ge=1, le=100)) -> dict[str, Any]:
+def list_machines_endpoint(
+    limit: int = Query(100, ge=1, le=100),
+    _auth: AuthContext = Depends(require_permission(PERM_MACHINES_READ)),
+) -> dict[str, Any]:
     try:
         iot_result = list_machine_device_sns(limit=limit)
     except ValueError as exc:
@@ -373,7 +788,10 @@ def list_machines_endpoint(limit: int = Query(100, ge=1, le=100)) -> dict[str, A
 
 
 @app.get("/api/machines/{device_sn}/config")
-def get_machine_config_endpoint(device_sn: str) -> dict[str, Any]:
+def get_machine_config_endpoint(
+    device_sn: str,
+    _auth: AuthContext = Depends(require_permission(PERM_MACHINES_READ)),
+) -> dict[str, Any]:
     if not device_sn.strip():
         raise HTTPException(status_code=400, detail="device_sn is required")
     try:
@@ -389,7 +807,11 @@ def get_machine_config_endpoint(device_sn: str) -> dict[str, Any]:
 
 
 @app.post("/api/machines/{device_sn}/config")
-def write_machine_config_endpoint(device_sn: str, payload: WriteConfigRequest) -> dict[str, Any]:
+def write_machine_config_endpoint(
+    device_sn: str,
+    payload: WriteConfigRequest,
+    _auth: AuthContext = Depends(require_permission(PERM_MACHINES_WRITE)),
+) -> dict[str, Any]:
     if not device_sn.strip():
         raise HTTPException(status_code=400, detail="device_sn is required")
     try:
@@ -404,7 +826,11 @@ def write_machine_config_endpoint(device_sn: str, payload: WriteConfigRequest) -
 
 
 @app.post("/api/machines/{device_sn}/create_order")
-def create_order_endpoint(device_sn: str, payload: CreateOrderRequest) -> dict[str, Any]:
+def create_order_endpoint(
+    device_sn: str,
+    payload: CreateOrderRequest,
+    _auth: AuthContext = Depends(require_permission(PERM_MACHINES_WRITE)),
+) -> dict[str, Any]:
     if not device_sn.strip():
         raise HTTPException(status_code=400, detail="device_sn is required")
     try:
@@ -423,7 +849,11 @@ def create_order_endpoint(device_sn: str, payload: CreateOrderRequest) -> dict[s
 
 
 @app.post("/api/machines/{device_sn}/close_order")
-def close_order_endpoint(device_sn: str, payload: CloseOrderRequest) -> dict[str, Any]:
+def close_order_endpoint(
+    device_sn: str,
+    payload: CloseOrderRequest,
+    _auth: AuthContext = Depends(require_permission(PERM_MACHINES_WRITE)),
+) -> dict[str, Any]:
     if not device_sn.strip():
         raise HTTPException(status_code=400, detail="device_sn is required")
     try:
@@ -443,7 +873,7 @@ def close_order_endpoint(device_sn: str, payload: CloseOrderRequest) -> dict[str
 
 
 @app.get("/api/meta")
-def api_meta() -> dict[str, Any]:
+def api_meta(_auth: AuthContext = Depends(require_permission(PERM_NAYAX_READ))) -> dict[str, Any]:
     """Describe query params for dashboard builders."""
     return {
         "version": "1.3.0",
@@ -491,6 +921,7 @@ def api_meta() -> dict[str, Any]:
 
 @app.get("/api/transactions")
 def list_transactions(
+    _auth: AuthContext = Depends(require_permission(PERM_NAYAX_READ)),
     db: Session = Depends(get_db),
     from_date: Optional[str] = Query(None, description="received_at >= (YYYY-MM-DD or ISO8601 UTC)"),
     to_date: Optional[str] = Query(None, description="received_at <= end of to_date (UTC)"),
@@ -565,6 +996,7 @@ def list_transactions(
 @app.get("/api/transactions/by-nayax/{nayax_tid}")
 def get_transaction_by_nayax_id(
     nayax_tid: int,
+    _auth: AuthContext = Depends(require_permission(PERM_NAYAX_READ)),
     db: Session = Depends(get_db),
     parse_payload: bool = Query(True),
 ) -> dict[str, Any]:
@@ -584,6 +1016,7 @@ def get_transaction_by_nayax_id(
 @app.get("/api/transactions/{row_id}")
 def get_transaction(
     row_id: int,
+    _auth: AuthContext = Depends(require_permission(PERM_NAYAX_READ)),
     db: Session = Depends(get_db),
     parse_payload: bool = Query(True),
 ) -> dict[str, Any]:
@@ -602,6 +1035,7 @@ def get_transaction(
 
 @app.get("/api/stats/summary")
 def stats_summary(
+    _auth: AuthContext = Depends(require_permission(PERM_NAYAX_READ)),
     db: Session = Depends(get_db),
     from_date: Optional[str] = Query(None),
     to_date: Optional[str] = Query(None),

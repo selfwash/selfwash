@@ -140,6 +140,45 @@ class NayaxTransactionProduct(Base):
     transaction: Mapped[NayaxTransaction] = relationship("NayaxTransaction", back_populates="products")
 
 
+class AppUser(Base):
+    """Dashboard users: username + password; permissions via app_user_permissions or is_superuser."""
+
+    __tablename__ = "app_users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
+    password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_superuser: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Self-service signup: pending until admin approves (admin-created users are always approved).
+    review_status: Mapped[str] = mapped_column(String(32), nullable=False, default="approved")
+    email: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    registration_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    permissions: Mapped[list["AppUserPermission"]] = relationship(
+        "AppUserPermission",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class AppUserPermission(Base):
+    __tablename__ = "app_user_permissions"
+    __table_args__ = (UniqueConstraint("user_id", "permission", name="uq_app_user_permission"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("app_users.id", ondelete="CASCADE"), nullable=False, index=True)
+    permission: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    user: Mapped[AppUser] = relationship("AppUser", back_populates="permissions")
+
+
 def _normalize_database_url(url: str) -> str:
     """Railway/Heroku use postgres:// or postgresql://; SQLAlchemy+psycopg3 needs postgresql+psycopg://."""
     u = url.strip()
@@ -215,6 +254,26 @@ def _sqlite_pragmas(dbapi_conn: Any, _record: Any) -> None:
         cursor.close()
 
 
+def _patch_sqlite_app_users_columns(eng: Engine) -> None:
+    """Add review columns to existing SQLite DBs (create_all does not alter tables)."""
+    if eng.dialect.name != "sqlite":
+        return
+    with eng.begin() as conn:
+        r = conn.execute(text("PRAGMA table_info(app_users)"))
+        col_names = {row[1] for row in r}
+        stmt: list[str] = []
+        if "review_status" not in col_names:
+            stmt.append(
+                "ALTER TABLE app_users ADD COLUMN review_status VARCHAR(32) NOT NULL DEFAULT 'approved'"
+            )
+        if "email" not in col_names:
+            stmt.append("ALTER TABLE app_users ADD COLUMN email VARCHAR(256)")
+        if "registration_note" not in col_names:
+            stmt.append("ALTER TABLE app_users ADD COLUMN registration_note TEXT")
+        for sql in stmt:
+            conn.execute(text(sql))
+
+
 def _apply_postgres_migrations(eng: Engine) -> None:
     """Run SQL files under migrations/ for existing Postgres DBs (e.g. int4 → bigint)."""
     if eng.dialect.name != "postgresql":
@@ -237,6 +296,7 @@ def _apply_postgres_migrations(eng: Engine) -> None:
 
 def init_db() -> None:
     Base.metadata.create_all(engine)
+    _patch_sqlite_app_users_columns(engine)
     _apply_postgres_migrations(engine)
     url = _engine_url()
     if url.startswith("sqlite"):
