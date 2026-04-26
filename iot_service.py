@@ -316,7 +316,7 @@ def _build_signature(
     nonce: str,
     enc1_json_body: str,
 ) -> str:
-    body_hash = _sha256_hex(enc1_json_body.encode("utf-8"))
+    body_b64 = base64.b64encode(enc1_json_body.encode("utf-8")).decode("utf-8")
     string_to_sign = "\n".join(
         [
             "POST",
@@ -324,7 +324,7 @@ def _build_signature(
             app_key,
             timestamp,
             nonce,
-            body_hash,
+            body_b64,
         ]
     )
     return hmac.new(
