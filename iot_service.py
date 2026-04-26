@@ -476,6 +476,7 @@ def create_machine_order(device_sn: str, prepay_money: float) -> dict:
     Create order only when query_state reports idle.
     """
     state_result = get_machine_state(device_sn=device_sn)
+    logger.warning("VMT query_state full response for %s: %s", device_sn, json.dumps(state_result, ensure_ascii=False))
     state = _extract_query_state(state_result)
     if state != "idle":
         raise ValueError(f"Machine {device_sn} is not idle (state={state or 'unknown'}).")
