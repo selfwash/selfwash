@@ -5,6 +5,7 @@ Read-only HTTP API for Lovable / dashboards. Uses the same db engine as consumer
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime, time, timezone
 from decimal import Decimal
@@ -34,6 +35,7 @@ from iot_service import (
 )
 
 READ_API_KEY = os.environ.get("READ_API_KEY", "").strip()
+logger = logging.getLogger(__name__)
 
 _TZ_ISRAEL = ZoneInfo("Asia/Jerusalem")
 
@@ -55,6 +57,19 @@ def _iso_israel(dt: Optional[datetime]) -> Optional[str]:
     if dt is None:
         return None
     return _as_utc(dt).astimezone(_TZ_ISRAEL).isoformat()
+
+
+def _log_iot_request_exception(exc: RequestException, *, context: str) -> None:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    response_body = getattr(response, "text", "")
+    logger.exception(
+        "IoT API request failed (%s). status_code=%s response=%s error=%s",
+        context,
+        status_code,
+        response_body[:1000],
+        str(exc),
+    )
 
 
 # Every scalar column we expose on each transaction (plus identifiers + optional payload/products).
@@ -365,7 +380,8 @@ def get_machine_config_endpoint(device_sn: str) -> dict[str, Any]:
         iot_result = read_machine_config(device_sn=device_sn.strip())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RequestException:
+    except RequestException as exc:
+        _log_iot_request_exception(exc, context=f"read_config device_sn={device_sn.strip()}")
         raise HTTPException(status_code=500, detail="Failed to call IoT command API")
     except Exception:
         raise HTTPException(status_code=500, detail="Unexpected server error while reading config")
