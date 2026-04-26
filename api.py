@@ -23,7 +23,15 @@ from sqlalchemy.orm import Session, selectinload
 load_dotenv()
 
 from db import NayaxTransaction, NayaxTransactionProduct, SessionLocal, init_db
-from iot_service import close_machine_order, create_machine_order, get_machine_state, start_machine
+from iot_service import (
+    close_machine_order,
+    create_machine_order,
+    get_machine_state,
+    list_machine_device_sns,
+    read_machine_config,
+    start_machine,
+    write_machine_config,
+)
 
 READ_API_KEY = os.environ.get("READ_API_KEY", "").strip()
 
@@ -297,6 +305,10 @@ class CloseOrderRequest(BaseModel):
     order_id: Optional[str] = None
 
 
+class WriteConfigRequest(BaseModel):
+    params: dict[str, Any]
+
+
 @app.post("/api/machines/start")
 def start_machine_endpoint(payload: StartMachineRequest) -> dict[str, Any]:
     if not payload.device_sn.strip():
@@ -329,6 +341,49 @@ def get_machine_state_endpoint(device_sn: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="Failed to call IoT command API")
     except Exception:
         raise HTTPException(status_code=500, detail="Unexpected server error while checking machine state")
+    return {"success": True, "device_sn": device_sn.strip(), "result": iot_result}
+
+
+@app.get("/api/machines/list")
+def list_machines_endpoint(limit: int = Query(100, ge=1, le=100)) -> dict[str, Any]:
+    try:
+        iot_result = list_machine_device_sns(limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RequestException:
+        raise HTTPException(status_code=500, detail="Failed to call IoT command API")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Unexpected server error while listing machines")
+    return {"success": True, "result": iot_result}
+
+
+@app.get("/api/machines/{device_sn}/config")
+def get_machine_config_endpoint(device_sn: str) -> dict[str, Any]:
+    if not device_sn.strip():
+        raise HTTPException(status_code=400, detail="device_sn is required")
+    try:
+        iot_result = read_machine_config(device_sn=device_sn.strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RequestException:
+        raise HTTPException(status_code=500, detail="Failed to call IoT command API")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Unexpected server error while reading config")
+    return {"success": True, "device_sn": device_sn.strip(), "result": iot_result}
+
+
+@app.post("/api/machines/{device_sn}/config")
+def write_machine_config_endpoint(device_sn: str, payload: WriteConfigRequest) -> dict[str, Any]:
+    if not device_sn.strip():
+        raise HTTPException(status_code=400, detail="device_sn is required")
+    try:
+        iot_result = write_machine_config(device_sn=device_sn.strip(), params=payload.params)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RequestException:
+        raise HTTPException(status_code=500, detail="Failed to call IoT command API")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Unexpected server error while writing config")
     return {"success": True, "device_sn": device_sn.strip(), "result": iot_result}
 
 

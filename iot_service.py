@@ -383,16 +383,17 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
         raise ValueError("Missing VMT_APP_KEY in environment.")
     if not app_secret:
         raise ValueError("Missing VMT_APP_SECRET in environment.")
-    if not device_sn:
+    if method != "list_device_sn" and not device_sn:
         raise ValueError("device_sn is required.")
     if not method:
         raise ValueError("method is required.")
 
     inner_payload = {
         "version": "V26.0",
-        "device_sn": device_sn,
         "method": method,
     }
+    if device_sn:
+        inner_payload["device_sn"] = device_sn
     if params:
         inner_payload["params"] = params
 
@@ -469,6 +470,24 @@ def start_machine(device_sn: str, prepay_money: float) -> dict:
 def get_machine_state(device_sn: str) -> dict:
     """Call IoT command API to fetch machine state."""
     return _send_command(device_sn=device_sn, method="query_state", params={})
+
+
+def list_machine_device_sns(limit: int = 100) -> dict:
+    """Call IoT command API to list device serial numbers."""
+    safe_limit = max(1, min(limit, 100))
+    return _send_command(device_sn="", method="list_device_sn", params={"limit": safe_limit})
+
+
+def read_machine_config(device_sn: str) -> dict:
+    """Call IoT command API to read machine configuration."""
+    return _send_command(device_sn=device_sn, method="read_config", params={})
+
+
+def write_machine_config(device_sn: str, params: dict) -> dict:
+    """Call IoT command API to write machine configuration."""
+    if not isinstance(params, dict) or not params:
+        raise ValueError("write_config params must be a non-empty JSON object.")
+    return _send_command(device_sn=device_sn, method="write_config", params=params)
 
 
 def create_machine_order(device_sn: str, prepay_money: float) -> dict:
