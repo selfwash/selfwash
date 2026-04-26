@@ -7,6 +7,7 @@ import hmac
 import logging
 import os
 import time
+from email.utils import parsedate_to_datetime
 from secrets import token_hex
 from uuid import uuid4
 
@@ -250,6 +251,36 @@ def _decode_vmt_response_fields(decoded: dict) -> dict:
     return decoded
 
 
+def _is_timestamp_expired(payload: dict) -> bool:
+    """Detect VMT timestamp expiry error from response payload."""
+    if not isinstance(payload, dict):
+        return False
+    response = payload.get("response")
+    if not isinstance(response, dict):
+        return False
+    errors = response.get("errors")
+    if isinstance(errors, list):
+        for item in errors:
+            if isinstance(item, str) and "timestamp expired" in item.lower():
+                return True
+    message = response.get("message")
+    if isinstance(message, str) and "timestamp expired" in message.lower():
+        return True
+    return False
+
+
+def _server_time_ms_from_response(response: requests.Response) -> int | None:
+    """Extract server clock (ms) from HTTP Date response header."""
+    date_header = response.headers.get("Date", "").strip()
+    if not date_header:
+        return None
+    try:
+        dt = parsedate_to_datetime(date_header)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
+
+
 def _build_signature(
     app_secret: str,
     app_key: str,
@@ -300,34 +331,57 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
         "params": params,
     }
 
-    timestamp = _now_ms()
-    enc1_json_body = _encrypt_enc1(inner_payload, kid=kid, ts_ms=timestamp)
-    request_nonce = token_hex(16)
-    signature = _build_signature(
-        app_secret=app_secret,
-        app_key=app_key,
-        timestamp=timestamp,
-        nonce=request_nonce,
-        enc1_json_body=enc1_json_body,
-    )
-
-    headers = {
-        "X-App-Key": app_key,
-        "X-Timestamp": timestamp,
-        "X-Nonce": request_nonce,
-        "X-Signature": signature,
-        "X-Region": region,
-        "Content-Type": "application/json",
-    }
     url = f"{base_url}{command_path}"
+    debug = _is_crypto_debug_enabled()
 
-    response = requests.post(url, data=enc1_json_body, headers=headers, timeout=15)
-    response.raise_for_status()
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = {"status_code": response.status_code, "raw": response.text}
-    return _decrypt_enc1_response(payload)
+    def _send_once(ts_ms: str) -> tuple[dict, requests.Response]:
+        enc1_json_body = _encrypt_enc1(inner_payload, kid=kid, ts_ms=ts_ms)
+        request_nonce = token_hex(16)
+        signature = _build_signature(
+            app_secret=app_secret,
+            app_key=app_key,
+            timestamp=ts_ms,
+            nonce=request_nonce,
+            enc1_json_body=enc1_json_body,
+        )
+        headers = {
+            "X-App-Key": app_key,
+            "X-Timestamp": ts_ms,
+            "X-Nonce": request_nonce,
+            "X-Signature": signature,
+            "X-Region": region,
+            "Content-Type": "application/json",
+        }
+        response = requests.post(url, data=enc1_json_body, headers=headers, timeout=15)
+        response.raise_for_status()
+        try:
+            raw_payload = response.json()
+        except ValueError:
+            raw_payload = {"status_code": response.status_code, "raw": response.text}
+        return _decrypt_enc1_response(raw_payload), response
+
+    first_ts = _now_ms()
+    payload, response = _send_once(first_ts)
+
+    if _is_timestamp_expired(payload):
+        server_ms = _server_time_ms_from_response(response)
+        if server_ms is not None:
+            retry_ts = str(server_ms + 1000)
+            if debug:
+                logger.warning(
+                    "VMT timestamp retry: first_ts=%s server_ms=%d retry_ts=%s",
+                    first_ts,
+                    server_ms,
+                    retry_ts,
+                )
+        else:
+            retry_ts = _now_ms()
+            if debug:
+                logger.warning("VMT timestamp retry: first_ts=%s no_server_date retry_ts=%s", first_ts, retry_ts)
+
+        payload, _ = _send_once(retry_ts)
+
+    return payload
 
 
 def start_machine(device_sn: str, prepay_money: float) -> dict:
