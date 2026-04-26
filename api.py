@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import datetime, time, timezone
 from decimal import Decimal
 from typing import Any, Literal, Optional
@@ -17,8 +18,12 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Header, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 from requests import RequestException
 from sqlalchemy import and_, asc, delete, desc, func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
 load_dotenv()
@@ -186,16 +191,55 @@ def _cors_config() -> dict[str, Any]:
 
 
 _cors = _cors_config()
-app = FastAPI(title="SelfWash API", version="1.4.0")
+# Used when CORSMiddleware does not add headers on some 5xx paths (browsers then report a CORS error).
+_CORS_STRICT_EXACT: list[str] = list(_cors.get("allow_origins") or [])
+_CORS_STRICT_RE: str | None = _cors.get("allow_origin_regex")
+_CORS_STRICT_CREDS: bool = bool(_cors.get("allow_credentials"))
+
+
+def _origin_allowed_for_cors(request_origin: str) -> bool:
+    if not request_origin:
+        return False
+    if _CORS_STRICT_EXACT == ["*"]:
+        return True
+    if request_origin in _CORS_STRICT_EXACT:
+        return True
+    if _CORS_STRICT_RE and re.fullmatch(_CORS_STRICT_RE, request_origin):
+        return True
+    return False
+
+
+class _CorsMissingHeaderPatch(BaseHTTPMiddleware):
+    """If response has no Access-Control-Allow-Origin, set it for allowed Lovable / CORS_ORIGINS (fixes browser CORS on 5xx)."""
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response = await call_next(request)
+        origin = request.headers.get("origin")
+        if not origin or response.headers.get("access-control-allow-origin"):
+            return response
+        if not _origin_allowed_for_cors(origin):
+            return response
+        if _CORS_STRICT_EXACT == ["*"]:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+        else:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            if "vary" not in {k.lower() for k in response.headers}:
+                response.headers["Vary"] = "Origin"
+            if _CORS_STRICT_CREDS:
+                response.headers["Access-Control-Allow-Credentials"] = "true"
+        return response
+
+
+app = FastAPI(title="SelfWash API", version="1.4.1")
 _cors_mw: dict[str, Any] = {
     "allow_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     "allow_headers": ["*"],
     **_cors,
 }
-# Starlette: omit allow_origin_regex when None (it must not be passed as explicit None? — tested: None is ok)
 if _cors_mw.get("allow_origin_regex") is None:
     _cors_mw.pop("allow_origin_regex", None)
 app.add_middleware(CORSMiddleware, **_cors_mw)
+app.add_middleware(_CorsMissingHeaderPatch)
 
 
 def get_db() -> Any:
@@ -318,6 +362,11 @@ def _maybe_bootstrap_admin() -> None:
 def _startup() -> None:
     init_db()
     _maybe_bootstrap_admin()
+    if not JWT_SECRET:
+        logger.warning(
+            "JWT_SECRET is not set: POST /api/auth/login and Bearer auth will return 503. "
+            "Set JWT_SECRET in Railway (Variables)."
+        )
 
 
 def _dec(v: Optional[Decimal]) -> Optional[float]:
@@ -555,9 +604,17 @@ def auth_register(body: RegisterRequest, db: Session = Depends(get_db)) -> dict[
         email=email,
         registration_note=note,
     )
-    db.add(u)
-    db.commit()
-    db.refresh(u)
+    try:
+        db.add(u)
+        db.commit()
+        db.refresh(u)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("auth_register DB error")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create account. Admin: check DB migrations, Railway logs, and app_users table.",
+        ) from exc
     _notify_signup_webhook(user_id=u.id, username=uname, email=email, note=note)
     return {
         "status": "pending",
