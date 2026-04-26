@@ -152,13 +152,24 @@ def _identifiers(row: NayaxTransaction) -> dict[str, Any]:
     }
 
 
-def _cors_origins() -> list[str]:
+def _cors_config() -> dict[str, Any]:
+    """
+    CORS: default * for dev. In production, CORS_ORIGINS is a comma list.
+    Lovable **preview** uses e.g. https://xxxx.lovableproject.com (not only *.lovable.app);
+    we allow that via allow_origin_regex when CORS_LOVABLE_REGEX=1 (default on).
+    """
     raw = os.environ.get("CORS_ORIGINS", "*").strip()
+    lovable_re = None
+    if os.environ.get("CORS_LOVABLE_REGEX", "1").lower() in ("1", "true", "yes"):
+        # Lovable preview + app hosting subdomains
+        lovable_re = r"^https://[a-zA-Z0-9.\-]+\.(lovableproject\.com|lovable\.app)$"
     if raw == "*":
-        return ["*"]
+        return {
+            "allow_origins": ["*"],
+            "allow_origin_regex": None,
+            "allow_credentials": False,
+        }
     origins = [o.strip() for o in raw.split(",") if o.strip()]
-
-    # Optional Lovable-specific origins can be appended without replacing CORS_ORIGINS.
     lovable_origin = os.environ.get("LOVABLE_ORIGIN", "").strip()
     if lovable_origin:
         origins.append(lovable_origin)
@@ -166,21 +177,25 @@ def _cors_origins() -> list[str]:
     if lovable_origins_raw:
         origins.extend([o.strip() for o in lovable_origins_raw.split(",") if o.strip()])
 
-    # De-duplicate while preserving order.
-    return list(dict.fromkeys(origins))
+    origins = list(dict.fromkeys(origins))
+    return {
+        "allow_origins": origins,
+        "allow_origin_regex": lovable_re,
+        "allow_credentials": True,
+    }
 
 
-_origins = _cors_origins()
-_cors_credentials = False if _origins == ["*"] else True
-
-app = FastAPI(title="SelfWash API", version="1.3.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_origins,
-    allow_credentials=_cors_credentials,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
+_cors = _cors_config()
+app = FastAPI(title="SelfWash API", version="1.4.0")
+_cors_mw: dict[str, Any] = {
+    "allow_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    "allow_headers": ["*"],
+    **_cors,
+}
+# Starlette: omit allow_origin_regex when None (it must not be passed as explicit None? — tested: None is ok)
+if _cors_mw.get("allow_origin_regex") is None:
+    _cors_mw.pop("allow_origin_regex", None)
+app.add_middleware(CORSMiddleware, **_cors_mw)
 
 
 def get_db() -> Any:
