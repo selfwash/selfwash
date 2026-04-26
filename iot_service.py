@@ -385,8 +385,9 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
         "version": "V26.0",
         "device_sn": device_sn,
         "method": method,
-        "params": params,
     }
+    if params:
+        inner_payload["params"] = params
 
     url = f"{base_url}{command_path}"
     debug = _is_crypto_debug_enabled()
