@@ -122,6 +122,40 @@ def _encrypt_enc1(inner_payload: dict, kid: str) -> str:
     return json.dumps(outer, separators=(",", ":"), ensure_ascii=False)
 
 
+def _decrypt_enc1_response(payload: dict) -> dict:
+    """
+    Decrypt ENC1 response envelope into readable JSON.
+
+    If payload is not ENC1, returns as-is.
+    """
+    if payload.get("ver") != "ENC1":
+        return payload
+
+    key = _load_enc_key()
+    aesgcm = AESGCM(key)
+
+    try:
+        iv = base64.b64decode(payload["iv"])
+        ct = base64.b64decode(payload["ct"])
+        tag = base64.b64decode(payload["tag"])
+    except KeyError as exc:
+        raise ValueError(f"ENC1 response missing field: {exc.args[0]}") from exc
+    except Exception as exc:
+        raise ValueError("Invalid base64 in ENC1 response fields") from exc
+
+    try:
+        plaintext = aesgcm.decrypt(iv, ct + tag, None)
+    except Exception as exc:
+        raise ValueError("Failed to decrypt ENC1 response") from exc
+
+    try:
+        decoded = json.loads(plaintext.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError("Decrypted ENC1 response is not valid JSON") from exc
+
+    return decoded if isinstance(decoded, dict) else {"data": decoded}
+
+
 def _build_signature(
     app_secret: str,
     app_key: str,
@@ -199,7 +233,7 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
         payload = response.json()
     except ValueError:
         payload = {"status_code": response.status_code, "raw": response.text}
-    return payload
+    return _decrypt_enc1_response(payload)
 
 
 def start_machine(device_sn: str, prepay_money: float) -> dict:
