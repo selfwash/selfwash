@@ -294,7 +294,7 @@ class CreateOrderRequest(BaseModel):
 
 
 class CloseOrderRequest(BaseModel):
-    order_id: str
+    order_id: Optional[str] = None
 
 
 @app.post("/api/machines/start")
@@ -363,7 +363,12 @@ def close_order_endpoint(device_sn: str, payload: CloseOrderRequest) -> dict[str
         raise HTTPException(status_code=500, detail="Failed to call IoT command API")
     except Exception:
         raise HTTPException(status_code=500, detail="Unexpected server error while closing order")
-    return {"success": True, "device_sn": device_sn.strip(), "order_id": payload.order_id.strip(), "result": iot_result}
+    return {
+        "success": True,
+        "device_sn": device_sn.strip(),
+        "order_id": payload.order_id.strip() if payload.order_id else None,
+        "result": iot_result,
+    }
 
 
 @app.get("/api/meta")

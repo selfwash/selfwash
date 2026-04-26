@@ -251,6 +251,34 @@ def _decode_vmt_response_fields(decoded: dict) -> dict:
     return decoded
 
 
+def _extract_query_state(payload: dict) -> str | None:
+    """
+    Try to extract device state from common VMT response shapes.
+    """
+    if not isinstance(payload, dict):
+        return None
+    response = payload.get("response")
+    if isinstance(response, dict):
+        body = response.get("response_body")
+        if isinstance(body, dict):
+            device_state = body.get("device_state")
+            if isinstance(device_state, dict):
+                state = device_state.get("state")
+                if isinstance(state, str):
+                    return state.strip().lower()
+            state = body.get("state")
+            if isinstance(state, str):
+                return state.strip().lower()
+    data = payload.get("data")
+    if isinstance(data, dict):
+        device_state = data.get("device_state")
+        if isinstance(device_state, dict):
+            state = device_state.get("state")
+            if isinstance(state, str):
+                return state.strip().lower()
+    return None
+
+
 def _is_timestamp_expired(payload: dict) -> bool:
     """Detect VMT timestamp expiry error from response payload."""
     if not isinstance(payload, dict):
@@ -284,11 +312,11 @@ def _server_time_from_response(response: requests.Response) -> int | None:
 def _build_signature(
     app_secret: str,
     app_key: str,
+    command_path: str,
     timestamp: str,
     nonce: str,
     enc1_json_body: str,
 ) -> str:
-    command_path = os.getenv("VMT_COMMAND_PATH", "").strip() or os.getenv("IOT_COMMAND_PATH", "").strip() or DEFAULT_COMMAND_PATH
     body_hash = _sha256_hex(enc1_json_body.encode("utf-8"))
     string_to_sign = "\n".join(
         [
@@ -340,6 +368,7 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
         signature = _build_signature(
             app_secret=app_secret,
             app_key=app_key,
+            command_path=command_path,
             timestamp=ts,
             nonce=request_nonce,
             enc1_json_body=enc1_json_body,
@@ -407,16 +436,23 @@ def get_machine_state(device_sn: str) -> dict:
 
 
 def create_machine_order(device_sn: str, prepay_money: float) -> dict:
-    """Call IoT command API to create an order on a machine."""
+    """
+    Create order only when query_state reports idle.
+    """
+    state_result = get_machine_state(device_sn=device_sn)
+    state = _extract_query_state(state_result)
+    if state != "idle":
+        raise ValueError(f"Machine {device_sn} is not idle (state={state or 'unknown'}).")
     return start_machine(device_sn=device_sn, prepay_money=prepay_money)
 
 
-def close_machine_order(device_sn: str, order_id: str) -> dict:
+def close_machine_order(device_sn: str, order_id: str | None = None) -> dict:
     """Call IoT command API to close an existing order."""
-    if not order_id or not order_id.strip():
-        raise ValueError("order_id is required.")
+    params: dict[str, str] = {}
+    if order_id and order_id.strip():
+        params["order_id"] = order_id.strip()
     return _send_command(
         device_sn=device_sn,
         method="close_order",
-        params={"order_id": order_id.strip()},
+        params=params,
     )
