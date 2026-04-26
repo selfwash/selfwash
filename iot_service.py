@@ -67,9 +67,9 @@ def _is_crypto_debug_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def _now_ms() -> str:
-    """Current UNIX timestamp in milliseconds."""
-    return str(int(time.time() * 1000))
+def _now_ts() -> str:
+    """Current UNIX timestamp in seconds (VMT expects seconds)."""
+    return str(int(time.time()))
 
 
 def _decode_b64_maybe(value: str, *, urlsafe: bool) -> bytes | None:
@@ -158,7 +158,7 @@ def _load_enc_key() -> bytes:
     return normalized
 
 
-def _encrypt_enc1(inner_payload: dict, kid: str, ts_ms: str) -> str:
+def _encrypt_enc1(inner_payload: dict, kid: str, ts: str) -> str:
     """
     Encrypt inner payload with AES-256-GCM and return ENC1 JSON string.
     """
@@ -176,7 +176,7 @@ def _encrypt_enc1(inner_payload: dict, kid: str, ts_ms: str) -> str:
         "ver": "ENC1",
         "alg": "AES-256-GCM",
         "kid": kid,
-        "ts": ts_ms,
+        "ts": ts,
         "nonce": body_nonce,
         "iv": base64.b64encode(iv).decode("utf-8"),
         "ct": base64.b64encode(ciphertext).decode("utf-8"),
@@ -269,14 +269,14 @@ def _is_timestamp_expired(payload: dict) -> bool:
     return False
 
 
-def _server_time_ms_from_response(response: requests.Response) -> int | None:
-    """Extract server clock (ms) from HTTP Date response header."""
+def _server_time_from_response(response: requests.Response) -> int | None:
+    """Extract server clock (seconds) from HTTP Date response header."""
     date_header = response.headers.get("Date", "").strip()
     if not date_header:
         return None
     try:
         dt = parsedate_to_datetime(date_header)
-        return int(dt.timestamp() * 1000)
+        return int(dt.timestamp())
     except Exception:
         return None
 
@@ -334,19 +334,19 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
     url = f"{base_url}{command_path}"
     debug = _is_crypto_debug_enabled()
 
-    def _send_once(ts_ms: str) -> tuple[dict, requests.Response]:
-        enc1_json_body = _encrypt_enc1(inner_payload, kid=kid, ts_ms=ts_ms)
+    def _send_once(ts: str) -> tuple[dict, requests.Response]:
+        enc1_json_body = _encrypt_enc1(inner_payload, kid=kid, ts=ts)
         request_nonce = token_hex(16)
         signature = _build_signature(
             app_secret=app_secret,
             app_key=app_key,
-            timestamp=ts_ms,
+            timestamp=ts,
             nonce=request_nonce,
             enc1_json_body=enc1_json_body,
         )
         headers = {
             "X-App-Key": app_key,
-            "X-Timestamp": ts_ms,
+            "X-Timestamp": ts,
             "X-Nonce": request_nonce,
             "X-Signature": signature,
             "X-Region": region,
@@ -360,22 +360,22 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
             raw_payload = {"status_code": response.status_code, "raw": response.text}
         return _decrypt_enc1_response(raw_payload), response
 
-    first_ts = _now_ms()
+    first_ts = _now_ts()
     payload, response = _send_once(first_ts)
 
     if _is_timestamp_expired(payload):
-        server_ms = _server_time_ms_from_response(response)
-        if server_ms is not None:
-            retry_ts = str(server_ms + 1000)
+        server_ts = _server_time_from_response(response)
+        if server_ts is not None:
+            retry_ts = str(server_ts + 1)
             if debug:
                 logger.warning(
-                    "VMT timestamp retry: first_ts=%s server_ms=%d retry_ts=%s",
+                    "VMT timestamp retry: first_ts=%s server_ts=%d retry_ts=%s",
                     first_ts,
-                    server_ms,
+                    server_ts,
                     retry_ts,
                 )
         else:
-            retry_ts = _now_ms()
+            retry_ts = _now_ts()
             if debug:
                 logger.warning("VMT timestamp retry: first_ts=%s no_server_date retry_ts=%s", first_ts, retry_ts)
 
