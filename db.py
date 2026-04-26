@@ -274,6 +274,46 @@ def _patch_sqlite_app_users_columns(eng: Engine) -> None:
             conn.execute(text(sql))
 
 
+def _ensure_postgres_dashboard_users(eng: Engine) -> None:
+    """
+    Idempotent: ensure app_users and app_user_permissions exist before running *.sql
+    migrations. Covers cases where create_all did not create them (or DB was from an
+    old deploy) so registration/auth does not 500 on missing table.
+    """
+    if eng.dialect.name != "postgresql":
+        return
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS app_users (
+            id SERIAL PRIMARY KEY,
+            username VARCHAR(128) NOT NULL UNIQUE,
+            password_hash VARCHAR(256) NOT NULL,
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            is_superuser BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS app_user_permissions (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+            permission VARCHAR(128) NOT NULL,
+            CONSTRAINT uq_app_user_permission UNIQUE (user_id, permission)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_app_user_permissions_user_id ON app_user_permissions(user_id)",
+        "ALTER TABLE app_users ADD COLUMN IF NOT EXISTS review_status VARCHAR(32) NOT NULL DEFAULT 'approved'",
+        "ALTER TABLE app_users ADD COLUMN IF NOT EXISTS email VARCHAR(256)",
+        "ALTER TABLE app_users ADD COLUMN IF NOT EXISTS registration_note TEXT",
+    ]
+    with eng.begin() as conn:
+        for raw in statements:
+            sql = raw.strip()
+            if sql:
+                conn.execute(text(sql))
+    log.info("Postgres: ensured app_users and app_user_permissions (if missing).")
+
+
 def _apply_postgres_migrations(eng: Engine) -> None:
     """Run SQL files under migrations/ for existing Postgres DBs (e.g. int4 → bigint)."""
     if eng.dialect.name != "postgresql":
@@ -297,6 +337,7 @@ def _apply_postgres_migrations(eng: Engine) -> None:
 def init_db() -> None:
     Base.metadata.create_all(engine)
     _patch_sqlite_app_users_columns(engine)
+    _ensure_postgres_dashboard_users(engine)
     _apply_postgres_migrations(engine)
     url = _engine_url()
     if url.startswith("sqlite"):
