@@ -272,6 +272,13 @@ def _extract_query_state(payload: dict) -> str | None:
     if isinstance(response, dict):
         body = response.get("response_body")
         if isinstance(body, dict):
+            body_data = body.get("data")
+            if isinstance(body_data, dict):
+                nested_device_state = body_data.get("device_state")
+                if isinstance(nested_device_state, dict):
+                    nested_state = nested_device_state.get("state")
+                    if isinstance(nested_state, str):
+                        return nested_state.strip().lower()
             device_state = body.get("device_state")
             if isinstance(device_state, dict):
                 state = device_state.get("state")
