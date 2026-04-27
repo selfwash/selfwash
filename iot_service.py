@@ -375,11 +375,45 @@ def _build_signature(
     ).hexdigest()
 
 
+def _vmt_result_code(payload: dict) -> int | None:
+    """Business result_code from VMT decrypted payload (0 = success)."""
+    if not isinstance(payload, dict):
+        return None
+    r = payload.get("response")
+    if not isinstance(r, dict) or "result_code" not in r:
+        return None
+    try:
+        return int(r["result_code"])
+    except (TypeError, ValueError):
+        return None
+
+
+def _vmt_region_candidates() -> list[str]:
+    """
+    Ordered X-Region values to try. On HTTP read/connect timeout, the client
+    retries with the next region (vendor: rotate active_region_key when
+    commands always time out).
+
+    Set VMT_ACTIVE_REGIONS=comma-separated keys to override the default list
+    (VMT_REGION or default is still honored as first entry when not included).
+    """
+    listed = os.getenv("VMT_ACTIVE_REGIONS", "").strip()
+    if listed:
+        parts = [p.strip() for p in listed.split(",") if p.strip()]
+        return list(dict.fromkeys(parts))
+    primary = os.getenv("VMT_REGION", "").strip() or DEFAULT_VMT_REGION
+    merged = [primary, "me-east-1", "ap-southeast-3", DEFAULT_VMT_REGION]
+    out: list[str] = []
+    for r in merged:
+        if r not in out:
+            out.append(r)
+    return out
+
+
 def _send_command(device_sn: str, method: str, params: dict) -> dict:
     app_key = os.getenv("VMT_APP_KEY", "").strip() or os.getenv("IOT_APP_KEY", "").strip() or DEFAULT_VMT_APP_KEY
     app_secret = os.getenv("VMT_APP_SECRET", "").strip() or os.getenv("IOT_APP_SECRET", "").strip()
     kid = os.getenv("VMT_ENC_KID", "").strip() or os.getenv("IOT_ENC_KID", "enc-18").strip()
-    region = os.getenv("VMT_REGION", "").strip() or DEFAULT_VMT_REGION
     base_url = (os.getenv("VMT_BASE_URL", "").strip() or os.getenv("IOT_BASE_URL", DEFAULT_BASE_URL).strip()).rstrip("/")
     command_path = os.getenv("VMT_COMMAND_PATH", "").strip() or os.getenv("IOT_COMMAND_PATH", "").strip() or DEFAULT_COMMAND_PATH
 
@@ -403,55 +437,88 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
 
     url = f"{base_url}{command_path}"
     debug = _is_crypto_debug_enabled()
-    def _send_once(ts: str) -> tuple[dict, requests.Response]:
-        request_nonce = token_hex(16)
-        enc1_json_body = _encrypt_enc1(inner_payload, kid=kid, ts=ts, nonce=request_nonce)
-        signature = _build_signature(
-            app_secret=app_secret,
-            app_key=app_key,
-            command_path=command_path,
-            timestamp=ts,
-            nonce=request_nonce,
-            enc1_json_body=enc1_json_body,
-        )
-        headers = {
-            "X-App-Key": app_key,
-            "X-Timestamp": ts,
-            "X-Nonce": request_nonce,
-            "X-Signature": signature,
-            "X-Region": region,
-            "Content-Type": "application/json",
-        }
-        response = requests.post(url, data=enc1_json_body, headers=headers, timeout=15)
-        response.raise_for_status()
+    regions = _vmt_region_candidates()
+    last_timeout: requests.exceptions.Timeout | None = None
+
+    for cur_region in regions:
+
+        def _send_once(ts: str, region: str = cur_region) -> tuple[dict, requests.Response]:
+            request_nonce = token_hex(16)
+            enc1_json_body = _encrypt_enc1(inner_payload, kid=kid, ts=ts, nonce=request_nonce)
+            signature = _build_signature(
+                app_secret=app_secret,
+                app_key=app_key,
+                command_path=command_path,
+                timestamp=ts,
+                nonce=request_nonce,
+                enc1_json_body=enc1_json_body,
+            )
+            headers = {
+                "X-App-Key": app_key,
+                "X-Timestamp": ts,
+                "X-Nonce": request_nonce,
+                "X-Signature": signature,
+                "X-Region": region,
+                "Content-Type": "application/json",
+            }
+            response = requests.post(url, data=enc1_json_body, headers=headers, timeout=15)
+            response.raise_for_status()
+            try:
+                raw_payload = response.json()
+            except ValueError:
+                raw_payload = {"status_code": response.status_code, "raw": response.text}
+            return _decrypt_enc1_response(raw_payload), response
+
         try:
-            raw_payload = response.json()
-        except ValueError:
-            raw_payload = {"status_code": response.status_code, "raw": response.text}
-        return _decrypt_enc1_response(raw_payload), response
+            first_ts = _now_ts()
+            payload, response = _send_once(first_ts)
 
-    first_ts = _now_ts()
-    payload, response = _send_once(first_ts)
+            if _is_timestamp_expired(payload):
+                server_ts = _server_time_from_response(response)
+                if server_ts is not None:
+                    retry_ts = str(server_ts + 1)
+                    if debug:
+                        logger.warning(
+                            "VMT timestamp retry: first_ts=%s server_ts=%d retry_ts=%s region=%s",
+                            first_ts,
+                            server_ts,
+                            retry_ts,
+                            cur_region,
+                        )
+                else:
+                    retry_ts = _now_ts()
+                    if debug:
+                        logger.warning(
+                            "VMT timestamp retry: first_ts=%s no_server_date retry_ts=%s region=%s",
+                            first_ts,
+                            retry_ts,
+                            cur_region,
+                        )
 
-    if _is_timestamp_expired(payload):
-        server_ts = _server_time_from_response(response)
-        if server_ts is not None:
-            retry_ts = str(server_ts + 1)
-            if debug:
+                payload, _ = _send_once(retry_ts)
+
+            if _vmt_result_code(payload) == 1:
                 logger.warning(
-                    "VMT timestamp retry: first_ts=%s server_ts=%d retry_ts=%s",
-                    first_ts,
-                    server_ts,
-                    retry_ts,
+                    "VMT result_code=1, resending once method=%s device_sn=%s region=%s",
+                    method,
+                    device_sn,
+                    cur_region,
                 )
-        else:
-            retry_ts = _now_ts()
-            if debug:
-                logger.warning("VMT timestamp retry: first_ts=%s no_server_date retry_ts=%s", first_ts, retry_ts)
+                payload, _ = _send_once(_now_ts())
 
-        payload, _ = _send_once(retry_ts)
+            return payload
+        except requests.Timeout as exc:
+            last_timeout = exc
+            logger.warning(
+                "VMT request timeout method=%s region=%s; trying next region if configured",
+                method,
+                cur_region,
+            )
+            continue
 
-    return payload
+    if last_timeout is not None:
+        raise last_timeout
+    raise RuntimeError("VMT command failed: no region candidates")
 
 
 def start_machine(device_sn: str, prepay_money: float) -> dict:
