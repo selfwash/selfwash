@@ -40,8 +40,12 @@ logger = logging.getLogger(__name__)
 
 
 def _generate_order_id() -> str:
-    """Generate a reasonably unique order ID."""
-    return f"ord-{int(time.time() * 1000)}-{uuid4().hex[:12]}"
+    """
+    Generate a short order ID for VMT/machine limits.
+    Format: YYMMDDHHMMSS + 4 hex chars (18 chars total).
+    """
+    ts = time.strftime("%y%m%d%H%M%S", time.gmtime())
+    return f"{ts}{uuid4().hex[:4]}"
 
 
 def _sha256_hex(raw: bytes) -> str:
