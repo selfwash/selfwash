@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import base64
 from datetime import datetime, time, timezone
 from decimal import Decimal
 from typing import Any, Literal, Optional
@@ -434,6 +435,40 @@ def _extract_callback_state(payload: dict[str, Any]) -> Optional[str]:
             if nested is not None and str(nested).strip():
                 return str(nested).strip()
     return None
+
+
+def _normalize_callback_payload(decoded_payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    VMT callback ENC1 may arrive in nested wrappers, e.g.:
+    {"data":"{\"body_b64\":\"...\"}"} or {"body_b64":"..."}.
+    Try a few safe unwrap passes until business JSON dict is reached.
+    """
+    current: Any = decoded_payload
+    for _ in range(4):
+        if not isinstance(current, dict):
+            break
+        if isinstance(current.get("body_b64"), str):
+            try:
+                raw = base64.b64decode(current["body_b64"]).decode("utf-8")
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    current = parsed
+                    continue
+            except Exception:
+                break
+        data_field = current.get("data")
+        if isinstance(data_field, str):
+            try:
+                parsed = json.loads(data_field)
+                if isinstance(parsed, dict):
+                    current = parsed
+                    continue
+            except Exception:
+                pass
+        break
+    if isinstance(current, dict):
+        return current
+    return decoded_payload
 
 
 def _tx_full(
@@ -912,6 +947,7 @@ def machine_callback_from_vmt(
     if payload.get("ver") == "ENC1":
         try:
             decoded_payload = _decrypt_enc1_response(payload)
+            decoded_payload = _normalize_callback_payload(decoded_payload)
         except Exception as exc:
             logger.exception("Failed to decrypt ENC1 machine callback payload")
             raise HTTPException(status_code=400, detail="Invalid ENC1 callback payload") from exc
