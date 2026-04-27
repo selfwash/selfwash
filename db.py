@@ -179,6 +179,24 @@ class AppUserPermission(Base):
     user: Mapped[AppUser] = relationship("AppUser", back_populates="permissions")
 
 
+class MachineState(Base):
+    """Latest + historical machine status pushed by VMT callback."""
+
+    __tablename__ = "machine_states"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_sn: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    state: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    source_event_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+    )
+
+
 def _normalize_database_url(url: str) -> str:
     """Railway/Heroku use postgres:// or postgresql://; SQLAlchemy+psycopg3 needs postgresql+psycopg://."""
     u = url.strip()

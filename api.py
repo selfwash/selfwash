@@ -31,6 +31,7 @@ load_dotenv()
 from db import (
     AppUser,
     AppUserPermission,
+    MachineState,
     NayaxTransaction,
     NayaxTransactionProduct,
     SessionLocal,
@@ -39,7 +40,6 @@ from db import (
 from iot_service import (
     close_machine_order,
     create_machine_order,
-    get_machine_state,
     list_machine_device_sns,
     read_machine_config,
     start_machine,
@@ -69,6 +69,7 @@ SIGNUP_NOTIFY_WEBHOOK_URL = os.environ.get("SIGNUP_NOTIFY_WEBHOOK_URL", "").stri
 SIGNUP_NOTIFY_WEBHOOK_SECRET = os.environ.get("SIGNUP_NOTIFY_WEBHOOK_SECRET", "").strip()
 _ALLOW_SIGNUP_RAW = os.environ.get("ALLOW_PUBLIC_SIGNUP", "1").strip().lower()
 ALLOW_PUBLIC_SIGNUP = _ALLOW_SIGNUP_RAW not in ("0", "false", "no", "")
+VMT_CALLBACK_TOKEN = os.environ.get("VMT_CALLBACK_TOKEN", "").strip()
 
 _TZ_ISRAEL = ZoneInfo("Asia/Jerusalem")
 
@@ -394,6 +395,30 @@ def _parse_end_of_day(s: str) -> datetime:
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     return datetime.fromisoformat(s)
+
+
+def _pick_str_any(payload: dict[str, Any], keys: list[str]) -> Optional[str]:
+    for k in keys:
+        v = payload.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    nested = payload.get("Data")
+    if isinstance(nested, dict):
+        for k in keys:
+            v = nested.get(k)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+    return None
+
+
+def _extract_callback_event_time(payload: dict[str, Any]) -> Optional[datetime]:
+    raw = _pick_str_any(payload, ["event_time", "timestamp", "time", "machine_time", "MachineTime"])
+    if raw:
+        try:
+            return _parse_instant(raw)
+        except Exception:
+            return None
+    return None
 
 
 def _tx_full(
@@ -828,19 +853,65 @@ def start_machine_endpoint(
 @app.get("/api/machines/{device_sn}/state")
 def get_machine_state_endpoint(
     device_sn: str,
+    db: Session = Depends(get_db),
     _auth: AuthContext = Depends(require_permission(PERM_MACHINES_READ)),
 ) -> dict[str, Any]:
-    if not device_sn.strip():
+    device_sn = device_sn.strip()
+    if not device_sn:
         raise HTTPException(status_code=400, detail="device_sn is required")
+    row = db.scalar(
+        select(MachineState)
+        .where(MachineState.device_sn == device_sn)
+        .order_by(desc(MachineState.created_at), desc(MachineState.id))
+        .limit(1)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No state found yet for machine {device_sn}")
     try:
-        iot_result = get_machine_state(device_sn=device_sn.strip())
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RequestException:
-        raise HTTPException(status_code=500, detail="Failed to call IoT command API")
+        payload = json.loads(row.payload_json)
     except Exception:
-        raise HTTPException(status_code=500, detail="Unexpected server error while checking machine state")
-    return {"success": True, "device_sn": device_sn.strip(), "result": iot_result}
+        payload = {"raw": row.payload_json}
+    return {
+        "success": True,
+        "device_sn": device_sn,
+        "state": row.state,
+        "source_event_time": _iso_utc(row.source_event_time),
+        "received_at": _iso_utc(row.created_at),
+        "result": payload,
+    }
+
+
+@app.post("/api/machines/callback")
+def machine_callback_from_vmt(
+    payload: dict[str, Any],
+    x_callback_token: Optional[str] = Header(None, alias="X-Callback-Token"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    VMT webhook/callback endpoint for machine status pushes.
+    Optional auth: set VMT_CALLBACK_TOKEN and send X-Callback-Token header.
+    """
+    if VMT_CALLBACK_TOKEN and x_callback_token != VMT_CALLBACK_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid callback token")
+    device_sn = _pick_str_any(payload, ["device_sn", "deviceSN", "DeviceSn", "DeviceSN", "sn", "SN"])
+    if not device_sn:
+        raise HTTPException(status_code=400, detail="Callback payload missing device_sn")
+    state = _pick_str_any(payload, ["state", "machine_state", "MachineState", "status", "Status"])
+    source_event_time = _extract_callback_event_time(payload)
+    row = MachineState(
+        device_sn=device_sn,
+        state=state,
+        source_event_time=source_event_time,
+        payload_json=json.dumps(payload, ensure_ascii=False),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {
+        "ok": True,
+        "machine_state_id": row.id,
+        "device_sn": device_sn,
+    }
 
 
 @app.get("/api/machines/list")
@@ -903,21 +974,37 @@ def create_order_endpoint(
     payload: CreateOrderRequest,
     _auth: AuthContext = Depends(require_permission(PERM_MACHINES_WRITE)),
 ) -> dict[str, Any]:
-    if not device_sn.strip():
+    device_sn = device_sn.strip()
+    if not device_sn:
         raise HTTPException(status_code=400, detail="device_sn is required")
     try:
-        iot_result = create_machine_order(device_sn=device_sn.strip(), prepay_money=payload.prepay_money)
+        iot_result = create_machine_order(device_sn=device_sn, prepay_money=payload.prepay_money)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RequestException:
+    except RequestException as exc:
+        _log_iot_request_exception(
+            exc,
+            context=f"create_order device_sn={device_sn} prepay_money={payload.prepay_money}",
+        )
         raise HTTPException(status_code=500, detail="Failed to call IoT command API")
     except Exception:
+        logger.exception(
+            "Unexpected server error while creating order. device_sn=%s prepay_money=%s",
+            device_sn,
+            payload.prepay_money,
+        )
         raise HTTPException(status_code=500, detail="Unexpected server error while creating order")
 
     order_id = iot_result.get("order_id")
     if not order_id:
+        logger.error(
+            "IoT API response missing order_id. device_sn=%s prepay_money=%s iot_result=%s",
+            device_sn,
+            payload.prepay_money,
+            str(iot_result)[:2000],
+        )
         raise HTTPException(status_code=500, detail="IoT API response missing order_id")
-    return {"success": True, "device_sn": device_sn.strip(), "order_id": order_id, "result": iot_result}
+    return {"success": True, "device_sn": device_sn, "order_id": order_id, "result": iot_result}
 
 
 @app.post("/api/machines/{device_sn}/close_order")
