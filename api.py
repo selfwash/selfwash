@@ -434,6 +434,19 @@ def _extract_callback_state(payload: dict[str, Any]) -> Optional[str]:
             nested = ds.get("state")
             if nested is not None and str(nested).strip():
                 return str(nested).strip()
+        order_info = data.get("order_info")
+        if isinstance(order_info, dict):
+            # order_update without explicit state means an active order in progress.
+            remain = order_info.get("operation_remain_time")
+            if remain is not None and str(remain).strip() not in ("", "0"):
+                return "busy"
+    event_name = _pick_str_any(payload, ["event", "event_type"])
+    if event_name:
+        ev = event_name.strip().lower()
+        if ev in ("order_create", "order_update"):
+            return "busy"
+        if ev == "order_close":
+            return "idle"
     return None
 
 
@@ -469,6 +482,26 @@ def _normalize_callback_payload(decoded_payload: dict[str, Any]) -> dict[str, An
     if isinstance(current, dict):
         return current
     return decoded_payload
+
+
+def _save_machine_state_snapshot(
+    db: Session,
+    *,
+    device_sn: str,
+    state: Optional[str],
+    payload: dict[str, Any],
+    source_event_time: Optional[datetime] = None,
+) -> MachineState:
+    row = MachineState(
+        device_sn=device_sn,
+        state=state,
+        source_event_time=source_event_time,
+        payload_json=json.dumps(payload, ensure_ascii=False),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
 
 
 def _tx_full(
@@ -921,10 +954,11 @@ def get_machine_state_endpoint(
         payload = json.loads(row.payload_json)
     except Exception:
         payload = {"raw": row.payload_json}
+    state = row.state or (_extract_callback_state(payload) if isinstance(payload, dict) else None)
     return {
         "success": True,
         "device_sn": device_sn,
-        "state": row.state,
+        "state": state,
         "source_event_time": _iso_utc(row.source_event_time),
         "received_at": _iso_utc(row.created_at),
         "result": payload,
@@ -956,15 +990,13 @@ def machine_callback_from_vmt(
         raise HTTPException(status_code=400, detail="Callback payload missing device_sn")
     state = _extract_callback_state(decoded_payload)
     source_event_time = _extract_callback_event_time(decoded_payload)
-    row = MachineState(
+    row = _save_machine_state_snapshot(
+        db,
         device_sn=device_sn,
         state=state,
+        payload=decoded_payload,
         source_event_time=source_event_time,
-        payload_json=json.dumps(decoded_payload, ensure_ascii=False),
     )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
     return {
         "ok": True,
         "machine_state_id": row.id,
@@ -1030,6 +1062,7 @@ def write_machine_config_endpoint(
 def create_order_endpoint(
     device_sn: str,
     payload: CreateOrderRequest,
+    db: Session = Depends(get_db),
     _auth: AuthContext = Depends(require_permission(PERM_MACHINES_WRITE)),
 ) -> dict[str, Any]:
     device_sn = device_sn.strip()
@@ -1062,6 +1095,21 @@ def create_order_endpoint(
             str(iot_result)[:2000],
         )
         raise HTTPException(status_code=500, detail="IoT API response missing order_id")
+    # Write-through state update so UI can reflect "busy" immediately even before callback arrives.
+    _save_machine_state_snapshot(
+        db,
+        device_sn=device_sn,
+        state="busy",
+        payload={
+            "version": "local",
+            "event": "create_order_ack",
+            "device_sn": device_sn,
+            "data": {
+                "order_info": {"order_id": order_id, "prepay_money": payload.prepay_money},
+                "iot_result": iot_result,
+            },
+        },
+    )
     return {"success": True, "device_sn": device_sn, "order_id": order_id, "result": iot_result}
 
 
@@ -1069,21 +1117,38 @@ def create_order_endpoint(
 def close_order_endpoint(
     device_sn: str,
     payload: CloseOrderRequest,
+    db: Session = Depends(get_db),
     _auth: AuthContext = Depends(require_permission(PERM_MACHINES_WRITE)),
 ) -> dict[str, Any]:
-    if not device_sn.strip():
+    device_sn = device_sn.strip()
+    if not device_sn:
         raise HTTPException(status_code=400, detail="device_sn is required")
     try:
-        iot_result = close_machine_order(device_sn=device_sn.strip(), order_id=payload.order_id)
+        iot_result = close_machine_order(device_sn=device_sn, order_id=payload.order_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RequestException:
         raise HTTPException(status_code=500, detail="Failed to call IoT command API")
     except Exception:
         raise HTTPException(status_code=500, detail="Unexpected server error while closing order")
+    # Write-through optimistic close so UI does not wait for delayed callback.
+    _save_machine_state_snapshot(
+        db,
+        device_sn=device_sn,
+        state="idle",
+        payload={
+            "version": "local",
+            "event": "close_order_ack",
+            "device_sn": device_sn,
+            "data": {
+                "order_info": {"order_id": payload.order_id.strip() if payload.order_id else None},
+                "iot_result": iot_result,
+            },
+        },
+    )
     return {
         "success": True,
-        "device_sn": device_sn.strip(),
+        "device_sn": device_sn,
         "order_id": payload.order_id.strip() if payload.order_id else None,
         "result": iot_result,
     }
