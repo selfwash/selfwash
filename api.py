@@ -38,6 +38,7 @@ from db import (
     init_db,
 )
 from iot_service import (
+    _decrypt_enc1_response,
     close_machine_order,
     create_machine_order,
     list_machine_device_sns,
@@ -418,6 +419,20 @@ def _extract_callback_event_time(payload: dict[str, Any]) -> Optional[datetime]:
             return _parse_instant(raw)
         except Exception:
             return None
+    return None
+
+
+def _extract_callback_state(payload: dict[str, Any]) -> Optional[str]:
+    state = _pick_str_any(payload, ["state", "machine_state", "MachineState", "status", "Status"])
+    if state:
+        return state
+    data = payload.get("data")
+    if isinstance(data, dict):
+        ds = data.get("device_state")
+        if isinstance(ds, dict):
+            nested = ds.get("state")
+            if nested is not None and str(nested).strip():
+                return str(nested).strip()
     return None
 
 
@@ -893,16 +908,23 @@ def machine_callback_from_vmt(
     """
     if VMT_CALLBACK_TOKEN and x_callback_token != VMT_CALLBACK_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid callback token")
-    device_sn = _pick_str_any(payload, ["device_sn", "deviceSN", "DeviceSn", "DeviceSN", "sn", "SN"])
+    decoded_payload = payload
+    if payload.get("ver") == "ENC1":
+        try:
+            decoded_payload = _decrypt_enc1_response(payload)
+        except Exception as exc:
+            logger.exception("Failed to decrypt ENC1 machine callback payload")
+            raise HTTPException(status_code=400, detail="Invalid ENC1 callback payload") from exc
+    device_sn = _pick_str_any(decoded_payload, ["device_sn", "deviceSN", "DeviceSn", "DeviceSN", "sn", "SN"])
     if not device_sn:
         raise HTTPException(status_code=400, detail="Callback payload missing device_sn")
-    state = _pick_str_any(payload, ["state", "machine_state", "MachineState", "status", "Status"])
-    source_event_time = _extract_callback_event_time(payload)
+    state = _extract_callback_state(decoded_payload)
+    source_event_time = _extract_callback_event_time(decoded_payload)
     row = MachineState(
         device_sn=device_sn,
         state=state,
         source_event_time=source_event_time,
-        payload_json=json.dumps(payload, ensure_ascii=False),
+        payload_json=json.dumps(decoded_payload, ensure_ascii=False),
     )
     db.add(row)
     db.commit()
