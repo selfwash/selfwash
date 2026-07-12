@@ -949,13 +949,14 @@ def get_machine_state_endpoint(
         .limit(1)
     )
     if row is None:
+        logger.info("get_machine_state device_sn=%s -> 404 no state found", device_sn)
         raise HTTPException(status_code=404, detail=f"No state found yet for machine {device_sn}")
     try:
         payload = json.loads(row.payload_json)
     except Exception:
         payload = {"raw": row.payload_json}
     state = row.state or (_extract_callback_state(payload) if isinstance(payload, dict) else None)
-    return {
+    response = {
         "success": True,
         "device_sn": device_sn,
         "state": state,
@@ -963,6 +964,12 @@ def get_machine_state_endpoint(
         "received_at": _iso_utc(row.created_at),
         "result": payload,
     }
+    logger.info(
+        "get_machine_state device_sn=%s response=%s",
+        device_sn,
+        json.dumps(response, default=str, ensure_ascii=False),
+    )
+    return response
 
 
 @app.post("/api/machines/callback")
