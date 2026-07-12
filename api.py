@@ -492,13 +492,24 @@ def _save_machine_state_snapshot(
     payload: dict[str, Any],
     source_event_time: Optional[datetime] = None,
 ) -> MachineState:
-    row = MachineState(
-        device_sn=device_sn,
-        state=state,
-        source_event_time=source_event_time,
-        payload_json=json.dumps(payload, ensure_ascii=False),
-    )
-    db.add(row)
+    """Upsert current state for device_sn (one row per machine, no history)."""
+    now = datetime.now(timezone.utc)
+    payload_json = json.dumps(payload, ensure_ascii=False)
+    row = db.scalar(select(MachineState).where(MachineState.device_sn == device_sn))
+    if row is None:
+        row = MachineState(
+            device_sn=device_sn,
+            state=state,
+            source_event_time=source_event_time,
+            payload_json=payload_json,
+            created_at=now,
+        )
+        db.add(row)
+    else:
+        row.state = state
+        row.source_event_time = source_event_time
+        row.payload_json = payload_json
+        row.created_at = now
     db.commit()
     db.refresh(row)
     return row
@@ -942,12 +953,7 @@ def get_machine_state_endpoint(
     device_sn = device_sn.strip()
     if not device_sn:
         raise HTTPException(status_code=400, detail="device_sn is required")
-    row = db.scalar(
-        select(MachineState)
-        .where(MachineState.device_sn == device_sn)
-        .order_by(desc(MachineState.created_at), desc(MachineState.id))
-        .limit(1)
-    )
+    row = db.scalar(select(MachineState).where(MachineState.device_sn == device_sn))
     if row is None:
         logger.info("get_machine_state device_sn=%s -> 404 no state found", device_sn)
         raise HTTPException(status_code=404, detail=f"No state found yet for machine {device_sn}")

@@ -180,12 +180,12 @@ class AppUserPermission(Base):
 
 
 class MachineState(Base):
-    """Latest + historical machine status pushed by VMT callback."""
+    """Current machine status per device_sn (callback + local write-through)."""
 
     __tablename__ = "machine_states"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    device_sn: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    device_sn: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
     state: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     source_event_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
