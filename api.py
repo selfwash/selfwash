@@ -9,6 +9,8 @@ import logging
 import os
 import re
 import base64
+import threading
+import time as time_module
 from datetime import datetime, time, timezone
 from decimal import Decimal
 from typing import Any, Literal, Optional
@@ -40,8 +42,10 @@ from db import (
 )
 from iot_service import (
     _decrypt_enc1_response,
+    _extract_query_state,
     close_machine_order,
     create_machine_order,
+    get_machine_state,
     list_machine_device_sns,
     read_machine_config,
     start_machine,
@@ -370,6 +374,12 @@ def _startup() -> None:
             "JWT_SECRET is not set: POST /api/auth/login and Bearer auth will return 503. "
             "Set JWT_SECRET in Railway (Variables)."
         )
+    _start_machine_state_poller()
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    _machine_state_poll_stop.set()
 
 
 def _dec(v: Optional[Decimal]) -> Optional[float]:
@@ -513,6 +523,131 @@ def _save_machine_state_snapshot(
     db.commit()
     db.refresh(row)
     return row
+
+
+def _extract_device_sns_from_list_payload(payload: Any) -> list[str]:
+    """Collect device_sn values from nested VMT list_device_sn response shapes."""
+    found: list[str] = []
+
+    def walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                key_l = str(key).lower()
+                if key_l in ("device_sn", "devicesn", "device_sn_list", "sn") and isinstance(value, str):
+                    sn = value.strip()
+                    if sn:
+                        found.append(sn)
+                elif key_l in ("device_sn", "devicesn", "sn") and isinstance(value, (int, float)):
+                    found.append(str(value))
+                else:
+                    walk(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, str) and item.strip():
+                    # list_device_sn sometimes returns a plain list of serials
+                    found.append(item.strip())
+                else:
+                    walk(item)
+
+    walk(payload)
+    return list(dict.fromkeys(found))
+
+
+def _collect_device_sns_for_poll(db: Session) -> list[str]:
+    sns: list[str] = []
+    try:
+        iot_result = list_machine_device_sns(limit=100)
+        sns.extend(_extract_device_sns_from_list_payload(iot_result))
+    except Exception:
+        logger.exception("Machine state poll: failed to list devices from VMT")
+    try:
+        sns.extend(list(db.scalars(select(MachineState.device_sn)).all()))
+    except Exception:
+        logger.exception("Machine state poll: failed to load device_sn from DB")
+    return list(dict.fromkeys(s.strip() for s in sns if s and str(s).strip()))
+
+
+def _poll_all_machine_states_once() -> None:
+    """Query VMT state for every known machine and upsert into machine_states."""
+    db = SessionLocal()
+    try:
+        device_sns = _collect_device_sns_for_poll(db)
+        if not device_sns:
+            logger.info("Machine state poll: no devices to query")
+            return
+        logger.info("Machine state poll: querying %s device(s)", len(device_sns))
+        ok = 0
+        for device_sn in device_sns:
+            try:
+                iot_result = get_machine_state(device_sn=device_sn)
+                state = _extract_query_state(iot_result)
+                now = datetime.now(timezone.utc)
+                _save_machine_state_snapshot(
+                    db,
+                    device_sn=device_sn,
+                    state=state,
+                    payload={
+                        "version": "poll",
+                        "event": "query_state_poll",
+                        "device_sn": device_sn,
+                        "data": iot_result,
+                    },
+                    source_event_time=now,
+                )
+                ok += 1
+                logger.info(
+                    "Machine state poll device_sn=%s state=%s",
+                    device_sn,
+                    state,
+                )
+            except Exception:
+                logger.exception("Machine state poll failed for device_sn=%s", device_sn)
+            time_module.sleep(0.15)
+        logger.info("Machine state poll done ok=%s/%s", ok, len(device_sns))
+    finally:
+        db.close()
+
+
+_machine_state_poll_stop = threading.Event()
+_machine_state_poll_thread: Optional[threading.Thread] = None
+
+
+def _machine_state_poll_interval_sec() -> int:
+    raw = os.environ.get("MACHINE_STATE_POLL_INTERVAL_SEC", "60").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 60
+
+
+def _machine_state_poll_loop() -> None:
+    interval = _machine_state_poll_interval_sec()
+    logger.info("Machine state poller running every %ss", interval)
+    while True:
+        try:
+            _poll_all_machine_states_once()
+        except Exception:
+            logger.exception("Machine state poll cycle failed")
+        if _machine_state_poll_stop.wait(timeout=interval):
+            logger.info("Machine state poller stopped")
+            break
+
+
+def _start_machine_state_poller() -> None:
+    global _machine_state_poll_thread
+    interval = _machine_state_poll_interval_sec()
+    if interval <= 0:
+        logger.info("Machine state poller disabled (MACHINE_STATE_POLL_INTERVAL_SEC=%s)", interval)
+        return
+    if _machine_state_poll_thread and _machine_state_poll_thread.is_alive():
+        return
+    _machine_state_poll_stop.clear()
+    _machine_state_poll_thread = threading.Thread(
+        target=_machine_state_poll_loop,
+        name="machine-state-poller",
+        daemon=True,
+    )
+    _machine_state_poll_thread.start()
 
 
 def _tx_full(
