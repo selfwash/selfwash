@@ -43,7 +43,6 @@ from db import (
 from iot_service import (
     _decrypt_enc1_response,
     _extract_query_state,
-    _vmt_result_code,
     close_machine_order,
     create_machine_order,
     get_machine_state,
@@ -581,22 +580,7 @@ def _poll_all_machine_states_once() -> None:
         for device_sn in device_sns:
             try:
                 iot_result = get_machine_state(device_sn=device_sn)
-                result_code = _vmt_result_code(iot_result)
                 state = _extract_query_state(iot_result)
-                # Failed/empty VMT poll must not overwrite a good callback/previous state.
-                if result_code is not None and result_code != 0:
-                    logger.warning(
-                        "Machine state poll skip device_sn=%s result_code=%s (keeping previous state)",
-                        device_sn,
-                        result_code,
-                    )
-                    continue
-                if not state:
-                    logger.warning(
-                        "Machine state poll skip device_sn=%s: no state in response (keeping previous state)",
-                        device_sn,
-                    )
-                    continue
                 now = datetime.now(timezone.utc)
                 _save_machine_state_snapshot(
                     db,
