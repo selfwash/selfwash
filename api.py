@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Header, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 from requests import RequestException
@@ -216,6 +217,27 @@ def _origin_allowed_for_cors(request_origin: str) -> bool:
     return False
 
 
+class _CorsMissingHeaderPatch(BaseHTTPMiddleware):
+    """If response has no Access-Control-Allow-Origin, set it for allowed Lovable / CORS_ORIGINS (fixes browser CORS on 5xx)."""
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response = await call_next(request)
+        origin = request.headers.get("origin")
+        if not origin or response.headers.get("access-control-allow-origin"):
+            return response
+        if not _origin_allowed_for_cors(origin):
+            return response
+        if _CORS_STRICT_EXACT == ["*"]:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+        else:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            if "vary" not in {k.lower() for k in response.headers}:
+                response.headers["Vary"] = "Origin"
+            if _CORS_STRICT_CREDS:
+                response.headers["Access-Control-Allow-Credentials"] = "true"
+        return response
+
+
 app = FastAPI(title="SelfWash API", version="1.4.1")
 _cors_mw: dict[str, Any] = {
     "allow_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -225,38 +247,7 @@ _cors_mw: dict[str, Any] = {
 if _cors_mw.get("allow_origin_regex") is None:
     _cors_mw.pop("allow_origin_regex", None)
 app.add_middleware(CORSMiddleware, **_cors_mw)
-
-
-@app.middleware("http")
-async def _http_middleware(request: Request, call_next) -> Response:
-    """
-    - Log VMT callbacks as soon as headers arrive (before body parse).
-    - Patch missing CORS ACAO on error responses (avoid BaseHTTPMiddleware — it can stall POSTs).
-    """
-    path = request.url.path
-    if path.rstrip("/").endswith("/api/machines/callback"):
-        client = request.client.host if request.client else "?"
-        logger.info(
-            "callback inbound method=%s client=%s content_length=%s content_type=%s",
-            request.method,
-            client,
-            request.headers.get("content-length"),
-            request.headers.get("content-type"),
-        )
-    response = await call_next(request)
-    if path.rstrip("/").endswith("/api/machines/callback"):
-        logger.info("callback done method=%s status=%s", request.method, response.status_code)
-    origin = request.headers.get("origin")
-    if origin and not response.headers.get("access-control-allow-origin") and _origin_allowed_for_cors(origin):
-        if _CORS_STRICT_EXACT == ["*"]:
-            response.headers["Access-Control-Allow-Origin"] = "*"
-        else:
-            response.headers["Access-Control-Allow-Origin"] = origin
-            if "vary" not in {k.lower() for k in response.headers}:
-                response.headers["Vary"] = "Origin"
-            if _CORS_STRICT_CREDS:
-                response.headers["Access-Control-Allow-Credentials"] = "true"
-    return response
+app.add_middleware(_CorsMissingHeaderPatch)
 
 
 def get_db() -> Any:
