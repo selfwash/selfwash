@@ -390,9 +390,9 @@ def _vmt_result_code(payload: dict) -> int | None:
 
 def _vmt_region_candidates() -> list[str]:
     """
-    Ordered X-Region values to try. On HTTP read/connect timeout, the client
-    retries with the next region (vendor: rotate active_region_key when
-    commands always time out).
+    Ordered X-Region values to try. On HTTP read/connect timeout or business
+    result_code=1 after retry, the client tries the next region (vendor: rotate
+    active_region_key when commands fail or time out).
 
     Set VMT_ACTIVE_REGIONS=comma-separated keys to override the default list
     (VMT_REGION or default is still honored as first entry when not included).
@@ -439,6 +439,7 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
     debug = _is_crypto_debug_enabled()
     regions = _vmt_region_candidates()
     last_timeout: requests.exceptions.Timeout | None = None
+    last_payload: dict | None = None
 
     for cur_region in regions:
 
@@ -506,6 +507,17 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
                 )
                 payload, _ = _send_once(_now_ts())
 
+            # Wrong region (or transient fail) often returns result_code=1 — try next region.
+            if _vmt_result_code(payload) == 1 and cur_region != regions[-1]:
+                last_payload = payload
+                logger.warning(
+                    "VMT result_code=1 after retry method=%s device_sn=%s region=%s; trying next region",
+                    method,
+                    device_sn,
+                    cur_region,
+                )
+                continue
+
             return payload
         except requests.Timeout as exc:
             last_timeout = exc
@@ -516,6 +528,8 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
             )
             continue
 
+    if last_payload is not None:
+        return last_payload
     if last_timeout is not None:
         raise last_timeout
     raise RuntimeError("VMT command failed: no region candidates")
