@@ -639,6 +639,10 @@ def _machine_state_poll_interval_sec() -> int:
 def _machine_state_poll_loop() -> None:
     interval = _machine_state_poll_interval_sec()
     logger.info("Machine state poller running every %ss", interval)
+    # Delay first cycle so /health can pass Railway deploy checks before VMT traffic.
+    if _machine_state_poll_stop.wait(timeout=min(20, interval)):
+        logger.info("Machine state poller stopped before first cycle")
+        return
     while True:
         try:
             _poll_all_machine_states_once()
