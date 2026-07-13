@@ -256,11 +256,6 @@ def _make_engine() -> Engine:
     ca = _connect_args(url)
     if ca:
         kwargs["connect_args"] = ca
-    # Postgres: avoid pool starvation when UI pages transactions while callbacks arrive.
-    if not url.startswith("sqlite"):
-        kwargs["pool_size"] = int(os.environ.get("DB_POOL_SIZE", "10"))
-        kwargs["max_overflow"] = int(os.environ.get("DB_MAX_OVERFLOW", "20"))
-        kwargs["pool_pre_ping"] = True
     return create_engine(url, **kwargs)
 
 

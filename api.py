@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Header, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -573,37 +573,31 @@ def _poll_all_machine_states_once() -> None:
     db = SessionLocal()
     try:
         device_sns = _collect_device_sns_for_poll(db)
-    finally:
-        db.close()
-
-    if not device_sns:
-        logger.info("Machine state poll: no devices to query")
-        return
-    logger.info("Machine state poll: querying %s device(s)", len(device_sns))
-    ok = 0
-    for device_sn in device_sns:
-        try:
-            # VMT HTTP must not hold a DB connection (starves callbacks under load).
-            iot_result = get_machine_state(device_sn=device_sn)
-            result_code = _vmt_result_code(iot_result)
-            state = _extract_query_state(iot_result)
-            # Failed/empty VMT poll must not overwrite a good callback/previous state.
-            if result_code is not None and result_code != 0:
-                logger.warning(
-                    "Machine state poll skip device_sn=%s result_code=%s (keeping previous state)",
-                    device_sn,
-                    result_code,
-                )
-                continue
-            if not state:
-                logger.warning(
-                    "Machine state poll skip device_sn=%s: no state in response (keeping previous state)",
-                    device_sn,
-                )
-                continue
-            now = datetime.now(timezone.utc)
-            db = SessionLocal()
+        if not device_sns:
+            logger.info("Machine state poll: no devices to query")
+            return
+        logger.info("Machine state poll: querying %s device(s)", len(device_sns))
+        ok = 0
+        for device_sn in device_sns:
             try:
+                iot_result = get_machine_state(device_sn=device_sn)
+                result_code = _vmt_result_code(iot_result)
+                state = _extract_query_state(iot_result)
+                # Failed/empty VMT poll must not overwrite a good callback/previous state.
+                if result_code is not None and result_code != 0:
+                    logger.warning(
+                        "Machine state poll skip device_sn=%s result_code=%s (keeping previous state)",
+                        device_sn,
+                        result_code,
+                    )
+                    continue
+                if not state:
+                    logger.warning(
+                        "Machine state poll skip device_sn=%s: no state in response (keeping previous state)",
+                        device_sn,
+                    )
+                    continue
+                now = datetime.now(timezone.utc)
                 _save_machine_state_snapshot(
                     db,
                     device_sn=device_sn,
@@ -616,18 +610,18 @@ def _poll_all_machine_states_once() -> None:
                     },
                     source_event_time=now,
                 )
-            finally:
-                db.close()
-            ok += 1
-            logger.info(
-                "Machine state poll device_sn=%s state=%s",
-                device_sn,
-                state,
-            )
-        except Exception:
-            logger.exception("Machine state poll failed for device_sn=%s", device_sn)
-        time_module.sleep(0.15)
-    logger.info("Machine state poll done ok=%s/%s", ok, len(device_sns))
+                ok += 1
+                logger.info(
+                    "Machine state poll device_sn=%s state=%s",
+                    device_sn,
+                    state,
+                )
+            except Exception:
+                logger.exception("Machine state poll failed for device_sn=%s", device_sn)
+            time_module.sleep(0.15)
+        logger.info("Machine state poll done ok=%s/%s", ok, len(device_sns))
+    finally:
+        db.close()
 
 
 _machine_state_poll_stop = threading.Event()
@@ -1139,59 +1133,43 @@ def get_machine_state_endpoint(
     return response
 
 
-def _process_machine_callback_payload(payload: dict[str, Any]) -> None:
-    """Decrypt/parse VMT push and upsert machine_states (runs after HTTP 200)."""
+@app.post("/api/machines/callback")
+def machine_callback_from_vmt(
+    payload: dict[str, Any],
+    x_callback_token: Optional[str] = Header(None, alias="X-Callback-Token"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    VMT webhook/callback endpoint for machine status pushes.
+    Optional auth: set VMT_CALLBACK_TOKEN and send X-Callback-Token header.
+    """
+    if VMT_CALLBACK_TOKEN and x_callback_token != VMT_CALLBACK_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid callback token")
     decoded_payload = payload
     if payload.get("ver") == "ENC1":
         try:
             decoded_payload = _decrypt_enc1_response(payload)
             decoded_payload = _normalize_callback_payload(decoded_payload)
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to decrypt ENC1 machine callback payload")
-            return
+            raise HTTPException(status_code=400, detail="Invalid ENC1 callback payload") from exc
     device_sn = _pick_str_any(decoded_payload, ["device_sn", "deviceSN", "DeviceSn", "DeviceSN", "sn", "SN"])
     if not device_sn:
-        logger.warning("Callback payload missing device_sn: %s", json.dumps(decoded_payload, ensure_ascii=False)[:500])
-        return
+        raise HTTPException(status_code=400, detail="Callback payload missing device_sn")
     state = _extract_callback_state(decoded_payload)
     source_event_time = _extract_callback_event_time(decoded_payload)
-    db = SessionLocal()
-    try:
-        row = _save_machine_state_snapshot(
-            db,
-            device_sn=device_sn,
-            state=state,
-            payload=decoded_payload,
-            source_event_time=source_event_time,
-        )
-        logger.info(
-            "machine callback saved device_sn=%s state=%s machine_state_id=%s",
-            device_sn,
-            state,
-            row.id,
-        )
-    except Exception:
-        logger.exception("Failed to save machine callback device_sn=%s", device_sn)
-    finally:
-        db.close()
-
-
-@app.post("/api/machines/callback")
-async def machine_callback_from_vmt(
-    payload: dict[str, Any],
-    background_tasks: BackgroundTasks,
-    x_callback_token: Optional[str] = Header(None, alias="X-Callback-Token"),
-) -> dict[str, Any]:
-    """
-    VMT webhook/callback endpoint for machine status pushes.
-    Ack immediately (provider times out ~5s); persist in background.
-    Optional auth: set VMT_CALLBACK_TOKEN and send X-Callback-Token header.
-    """
-    if VMT_CALLBACK_TOKEN and x_callback_token != VMT_CALLBACK_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid callback token")
-    logger.info("machine callback received, queueing persist")
-    background_tasks.add_task(_process_machine_callback_payload, payload)
-    return {"ok": True, "queued": True}
+    row = _save_machine_state_snapshot(
+        db,
+        device_sn=device_sn,
+        state=state,
+        payload=decoded_payload,
+        source_event_time=source_event_time,
+    )
+    return {
+        "ok": True,
+        "machine_state_id": row.id,
+        "device_sn": device_sn,
+    }
 
 
 @app.get("/api/machines/list")
