@@ -563,6 +563,7 @@ def write_machine_config(device_sn: str, params: dict) -> dict:
 
 def create_machine_order(device_sn: str, prepay_money: float) -> dict:
     """
+    Vendor rule: call query_state only when creating an order; otherwise rely on machine uploads.
     Create order only when query_state reports idle.
     """
     state_result = get_machine_state(device_sn=device_sn)

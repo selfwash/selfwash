@@ -18,10 +18,9 @@ from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Header, Query, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Header, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 from requests import RequestException
@@ -216,27 +215,6 @@ def _origin_allowed_for_cors(request_origin: str) -> bool:
     return False
 
 
-class _CorsMissingHeaderPatch(BaseHTTPMiddleware):
-    """If response has no Access-Control-Allow-Origin, set it for allowed Lovable / CORS_ORIGINS (fixes browser CORS on 5xx)."""
-
-    async def dispatch(self, request: Request, call_next) -> Response:
-        response = await call_next(request)
-        origin = request.headers.get("origin")
-        if not origin or response.headers.get("access-control-allow-origin"):
-            return response
-        if not _origin_allowed_for_cors(origin):
-            return response
-        if _CORS_STRICT_EXACT == ["*"]:
-            response.headers["Access-Control-Allow-Origin"] = "*"
-        else:
-            response.headers["Access-Control-Allow-Origin"] = origin
-            if "vary" not in {k.lower() for k in response.headers}:
-                response.headers["Vary"] = "Origin"
-            if _CORS_STRICT_CREDS:
-                response.headers["Access-Control-Allow-Credentials"] = "true"
-        return response
-
-
 app = FastAPI(title="SelfWash API", version="1.4.1")
 _cors_mw: dict[str, Any] = {
     "allow_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -246,7 +224,34 @@ _cors_mw: dict[str, Any] = {
 if _cors_mw.get("allow_origin_regex") is None:
     _cors_mw.pop("allow_origin_regex", None)
 app.add_middleware(CORSMiddleware, **_cors_mw)
-app.add_middleware(_CorsMissingHeaderPatch)
+
+
+@app.middleware("http")
+async def _http_middleware(request: Request, call_next) -> Response:
+    """Log machine uploads early; patch missing CORS on error responses."""
+    path = request.url.path
+    if path.rstrip("/").endswith("/api/machines/callback"):
+        client = request.client.host if request.client else "?"
+        logger.info(
+            "callback inbound method=%s client=%s content_length=%s",
+            request.method,
+            client,
+            request.headers.get("content-length"),
+        )
+    response = await call_next(request)
+    if path.rstrip("/").endswith("/api/machines/callback"):
+        logger.info("callback done method=%s status=%s", request.method, response.status_code)
+    origin = request.headers.get("origin")
+    if origin and not response.headers.get("access-control-allow-origin") and _origin_allowed_for_cors(origin):
+        if _CORS_STRICT_EXACT == ["*"]:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+        else:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            if "vary" not in {k.lower() for k in response.headers}:
+                response.headers["Vary"] = "Origin"
+            if _CORS_STRICT_CREDS:
+                response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
 
 
 def get_db() -> Any:
@@ -613,11 +618,13 @@ _machine_state_poll_thread: Optional[threading.Thread] = None
 
 
 def _machine_state_poll_interval_sec() -> int:
-    raw = os.environ.get("MACHINE_STATE_POLL_INTERVAL_SEC", "60").strip()
+    # Vendor: query_state only when creating an order; machine uploads state otherwise.
+    # Default 0 = disabled. Set MACHINE_STATE_POLL_INTERVAL_SEC>0 only for emergency debugging.
+    raw = os.environ.get("MACHINE_STATE_POLL_INTERVAL_SEC", "0").strip()
     try:
         return int(raw)
     except ValueError:
-        return 60
+        return 0
 
 
 def _machine_state_poll_loop() -> None:
@@ -1113,43 +1120,61 @@ def get_machine_state_endpoint(
     return response
 
 
-@app.post("/api/machines/callback")
-def machine_callback_from_vmt(
-    payload: dict[str, Any],
-    x_callback_token: Optional[str] = Header(None, alias="X-Callback-Token"),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    """
-    VMT webhook/callback endpoint for machine status pushes.
-    Optional auth: set VMT_CALLBACK_TOKEN and send X-Callback-Token header.
-    """
-    if VMT_CALLBACK_TOKEN and x_callback_token != VMT_CALLBACK_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid callback token")
+def _process_machine_callback_payload(payload: dict[str, Any]) -> None:
+    """Persist machine-uploaded state (runs after HTTP 200 to beat provider ~5s timeout)."""
     decoded_payload = payload
     if payload.get("ver") == "ENC1":
         try:
             decoded_payload = _decrypt_enc1_response(payload)
             decoded_payload = _normalize_callback_payload(decoded_payload)
-        except Exception as exc:
+        except Exception:
             logger.exception("Failed to decrypt ENC1 machine callback payload")
-            raise HTTPException(status_code=400, detail="Invalid ENC1 callback payload") from exc
+            return
     device_sn = _pick_str_any(decoded_payload, ["device_sn", "deviceSN", "DeviceSn", "DeviceSN", "sn", "SN"])
     if not device_sn:
-        raise HTTPException(status_code=400, detail="Callback payload missing device_sn")
+        logger.warning(
+            "Callback payload missing device_sn: %s",
+            json.dumps(decoded_payload, ensure_ascii=False)[:500],
+        )
+        return
     state = _extract_callback_state(decoded_payload)
     source_event_time = _extract_callback_event_time(decoded_payload)
-    row = _save_machine_state_snapshot(
-        db,
-        device_sn=device_sn,
-        state=state,
-        payload=decoded_payload,
-        source_event_time=source_event_time,
-    )
-    return {
-        "ok": True,
-        "machine_state_id": row.id,
-        "device_sn": device_sn,
-    }
+    db = SessionLocal()
+    try:
+        row = _save_machine_state_snapshot(
+            db,
+            device_sn=device_sn,
+            state=state,
+            payload=decoded_payload,
+            source_event_time=source_event_time,
+        )
+        logger.info(
+            "machine callback saved device_sn=%s state=%s machine_state_id=%s",
+            device_sn,
+            state,
+            row.id,
+        )
+    except Exception:
+        logger.exception("Failed to save machine callback device_sn=%s", device_sn)
+    finally:
+        db.close()
+
+
+@app.post("/api/machines/callback")
+async def machine_callback_from_vmt(
+    payload: dict[str, Any],
+    background_tasks: BackgroundTasks,
+    x_callback_token: Optional[str] = Header(None, alias="X-Callback-Token"),
+) -> dict[str, Any]:
+    """
+    VMT machine state upload (forward_message).
+    Ack immediately; persist in background. Optional X-Callback-Token when VMT_CALLBACK_TOKEN is set.
+    """
+    if VMT_CALLBACK_TOKEN and x_callback_token != VMT_CALLBACK_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid callback token")
+    logger.info("machine callback received, queueing persist")
+    background_tasks.add_task(_process_machine_callback_payload, payload)
+    return {"ok": True, "queued": True}
 
 
 @app.get("/api/machines/list")
