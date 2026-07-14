@@ -372,8 +372,12 @@ def _maybe_bootstrap_admin() -> None:
 
 @app.on_event("startup")
 def _startup() -> None:
-    init_db()
-    _maybe_bootstrap_admin()
+    # Keep startup light so Railway /health can pass quickly.
+    try:
+        init_db()
+        _maybe_bootstrap_admin()
+    except Exception:
+        logger.exception("Startup DB init failed (API still serves /health)")
     if not JWT_SECRET:
         logger.warning(
             "JWT_SECRET is not set: POST /api/auth/login and Bearer auth will return 503. "
