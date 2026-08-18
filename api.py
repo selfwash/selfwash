@@ -384,6 +384,11 @@ def _startup() -> None:
             "Set JWT_SECRET in Railway (Variables)."
         )
     _start_machine_state_poller()
+    threading.Thread(
+        target=_heal_machine_states_from_payloads,
+        name="machine-state-heal",
+        daemon=True,
+    ).start()
 
 
 @app.on_event("shutdown")
@@ -537,6 +542,43 @@ def _save_machine_state_snapshot(
     db.commit()
     db.refresh(row)
     return row
+
+
+def _derived_state_from_stored_payload(row: MachineState) -> Optional[str]:
+    try:
+        payload = json.loads(row.payload_json)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return _extract_callback_state(payload)
+
+
+def _heal_machine_states_from_payloads() -> None:
+    """Correct derived state from the last manufacturer upload. Does not call query_state."""
+    db = SessionLocal()
+    try:
+        rows = list(db.scalars(select(MachineState)).all())
+        fixed = 0
+        for row in rows:
+            derived = _derived_state_from_stored_payload(row)
+            if derived and derived != row.state:
+                logger.info(
+                    "Healing machine_states device_sn=%s %s -> %s",
+                    row.device_sn,
+                    row.state,
+                    derived,
+                )
+                row.state = derived
+                fixed += 1
+        if fixed:
+            db.commit()
+        logger.info("Machine state heal done fixed=%s/%s", fixed, len(rows))
+    except Exception:
+        logger.exception("Machine state heal failed")
+        db.rollback()
+    finally:
+        db.close()
 
 
 def _extract_device_sns_from_list_payload(payload: Any) -> list[str]:
@@ -1114,6 +1156,9 @@ def get_machine_state_endpoint(
         payload = {"raw": row.payload_json}
     derived = _extract_callback_state(payload) if isinstance(payload, dict) else None
     state = derived or row.state
+    if derived and derived != row.state:
+        row.state = derived
+        db.commit()
     response = {
         "success": True,
         "device_sn": device_sn,
