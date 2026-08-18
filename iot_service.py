@@ -388,11 +388,22 @@ def _vmt_result_code(payload: dict) -> int | None:
         return None
 
 
+def _vmt_error_messages(payload: dict) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    response = payload.get("response")
+    if not isinstance(response, dict):
+        return []
+    errors = response.get("errors")
+    if not isinstance(errors, list):
+        return []
+    return [item.strip() for item in errors if isinstance(item, str) and item.strip()]
+
+
 def _vmt_region_candidates() -> list[str]:
     """
-    Ordered X-Region values to try. On HTTP read/connect timeout, the client
-    retries with the next region (vendor: rotate active_region_key when
-    commands always time out).
+    Ordered X-Region values to try. On HTTP timeout or business result_code=1
+    (e.g. device not online on this region), try the next region.
 
     Set VMT_ACTIVE_REGIONS=comma-separated keys to override the default list
     (VMT_REGION or default is still honored as first entry when not included).
@@ -439,6 +450,7 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
     debug = _is_crypto_debug_enabled()
     regions = _vmt_region_candidates()
     last_timeout: requests.exceptions.Timeout | None = None
+    last_payload: dict | None = None
 
     for cur_region in regions:
 
@@ -506,6 +518,17 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
                 )
                 payload, _ = _send_once(_now_ts())
 
+            # Wrong region often returns result_code=1 "device is not online".
+            if _vmt_result_code(payload) == 1 and cur_region != regions[-1]:
+                last_payload = payload
+                logger.warning(
+                    "VMT result_code=1 after retry method=%s device_sn=%s region=%s; trying next region",
+                    method,
+                    device_sn,
+                    cur_region,
+                )
+                continue
+
             return payload
         except requests.Timeout as exc:
             last_timeout = exc
@@ -516,6 +539,8 @@ def _send_command(device_sn: str, method: str, params: dict) -> dict:
             )
             continue
 
+    if last_payload is not None:
+        return last_payload
     if last_timeout is not None:
         raise last_timeout
     raise RuntimeError("VMT command failed: no region candidates")
@@ -568,9 +593,20 @@ def create_machine_order(device_sn: str, prepay_money: float) -> dict:
     """
     state_result = get_machine_state(device_sn=device_sn)
     logger.warning("VMT query_state full response for %s: %s", device_sn, json.dumps(state_result, ensure_ascii=False))
+    vmt_errors = _vmt_error_messages(state_result)
+    if _vmt_result_code(state_result) != 0:
+        detail = vmt_errors[0] if vmt_errors else "query_state failed"
+        raise ValueError(f"Machine {device_sn} is not reachable ({detail}).")
     state = _extract_query_state(state_result)
-    if state != "idle":
-        raise ValueError(f"Machine {device_sn} is not idle (state={state or 'unknown'}).")
+    # VMT may return result_code=0 with empty response_body (no idle/busy field).
+    # Only block when the manufacturer explicitly reports a non-idle state.
+    if state and state != "idle":
+        raise ValueError(f"Machine {device_sn} is not idle (state={state}).")
+    if not state:
+        logger.warning(
+            "VMT query_state succeeded without device_state for %s; proceeding with create_order",
+            device_sn,
+        )
     return start_machine(device_sn=device_sn, prepay_money=prepay_money)
 
 
