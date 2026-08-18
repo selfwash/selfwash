@@ -446,26 +446,31 @@ def _extract_callback_state(payload: dict[str, Any]) -> Optional[str]:
     state = _pick_str_any(payload, ["state", "machine_state", "MachineState", "status", "Status"])
     if state:
         return state
-    data = payload.get("data")
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else None
     if isinstance(data, dict):
         ds = data.get("device_state")
         if isinstance(ds, dict):
             nested = ds.get("state")
             if nested is not None and str(nested).strip():
                 return str(nested).strip()
+
+    event_name = _pick_str_any(payload, ["event", "event_type"])
+    ev = event_name.strip().lower() if event_name else ""
+    # order_close payloads still include leftover operation_remain_time; that is not an active wash.
+    if ev == "order_close":
+        return "idle"
+    if ev in ("order_create", "order_update"):
+        return "busy"
+
+    if isinstance(data, dict):
         order_info = data.get("order_info")
         if isinstance(order_info, dict):
-            # order_update without explicit state means an active order in progress.
+            close_type = order_info.get("close_type")
+            if close_type not in (None, ""):
+                return "idle"
             remain = order_info.get("operation_remain_time")
             if remain is not None and str(remain).strip() not in ("", "0"):
                 return "busy"
-    event_name = _pick_str_any(payload, ["event", "event_type"])
-    if event_name:
-        ev = event_name.strip().lower()
-        if ev in ("order_create", "order_update"):
-            return "busy"
-        if ev == "order_close":
-            return "idle"
     return None
 
 
@@ -1107,7 +1112,8 @@ def get_machine_state_endpoint(
         payload = json.loads(row.payload_json)
     except Exception:
         payload = {"raw": row.payload_json}
-    state = row.state or (_extract_callback_state(payload) if isinstance(payload, dict) else None)
+    derived = _extract_callback_state(payload) if isinstance(payload, dict) else None
+    state = derived or row.state
     response = {
         "success": True,
         "device_sn": device_sn,
